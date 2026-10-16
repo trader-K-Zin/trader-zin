@@ -1,0 +1,40 @@
+name: Trader Jin Quant Tracker
+
+on:
+  schedule:
+    # 1차 실행: 한국 시간 월~금 오전 10시 05분 (UTC 01:05) -> 당일 아침 8~10시 +3% 슈팅 채점 및 승률 DB 업데이트
+    - cron: '5 1 * * 1-5'
+    # 2차 실행: 한국 시간 월~금 오후 4시 15분 (UTC 07:15) -> 장 마감 수급 확정 및 내일 아침 공략 후보 추출
+    - cron: '15 7 * * 1-5'
+  workflow_dispatch: # 지금 바로 수동으로 눌러서 즉시 테스트하는 버튼
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 저장소 불러오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 필수 금융 및 크롤링 패키지 설치
+        run: |
+          pip install --upgrade pip
+          pip install pykrx pandas requests beautifulsoup4 lxml
+
+      - name: 주도주 역추적 및 승률 계산 실행
+        run: python collector.py
+
+      - name: 누적 DB(CSV) 및 승률 리포트(MD) 자동 저장
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Trader Jin Quant Bot"
+          git add history_db.csv WIN_RATE_REPORT.md
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update Win Rate DB & Report"
+          git push
