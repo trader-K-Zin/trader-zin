@@ -3,12 +3,28 @@ import datetime
 import time
 import requests
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 import pandas as pd
 
 now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 DB_FILE = "history_db.csv"
 REPORT_FILE = "WIN_RATE_REPORT.md"
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+def get_popular_top10():
+    """네이버 금융 종일 기준 인기 검색어 TOP 10 티커 및 종목명 추출"""
+    top10_tickers = []
+    try:
+        url = "https://finance.naver.com/sise/lastsearch2.naver"
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
+        for a in soup.select('a.tltle')[:10]:
+            href = a.get('href', '')
+            if 'code=' in href:
+                top10_tickers.append(href.split('code=')[-1].strip())
+    except Exception:
+        pass
+    return set(top10_tickers)
 
 def get_major_universe():
     tickers = {}
@@ -110,6 +126,9 @@ def main():
         inv_cache[code] = get_investor_data(code)
         time.sleep(0.02)
 
+    # 당일 실시간 네이버 인기검색 TOP 10
+    popular_set = get_popular_top10()
+
     records = []
     for d1_date in eval_days:
         idx = trading_days.index(d1_date)
@@ -137,7 +156,8 @@ def main():
             inst_d2, for_d2 = inv_data.get(d2_date, (0, 0))
             inst_d3, for_d3 = inv_data.get(d3_date, (0, 0))
 
-            s1_pop = 1 if rank <= 10 else 0
+            # S1_인기검색TOP10: 실시간 인기검색 종목이거나 과거 특정일 관심집중 상위 매칭
+            s1_pop = 1 if (code in popular_set or rank <= 10) else 0
             s2_for = 1 if for_d1 > 0 else 0
             s3_for3 = 1 if (for_d1 > 0 and for_d2 > 0 and for_d3 > 0) else 0
             s4_inst = 1 if inst_d1 > 0 else 0
@@ -148,7 +168,7 @@ def main():
             s9_major = 1 if (inst_d1 > 0 and val_d1 >= avg_val_20d * 1.5) else 0
             s10_candle = 1 if (fluc >= 3.0 and high_p > 0 and close_p >= high_p * 0.98) else 0
             s11_trend = 1 if (ma5 > ma20 > ma60) else 0
-            s12_scombo = 1 if (s8_twin == 1 and s6_high == 1 and s10_candle == 1) else 0
+            s12_scombo = 1 if (s1_pop == 1 and s8_twin == 1 and (s10_candle == 1 or s6_high == 1)) else 0
 
             sub_next = df_c[df_c["Date"] == d_day]
             ret = round(((float(sub_next.iloc[0]["High"]) - close_p) / close_p) * 100, 2) if (not sub_next.empty and close_p > 0) else 0.0
@@ -158,7 +178,7 @@ def main():
                 "D1_Date": d1_date, "D_Day": d_day, "Rank": rank, "Ticker": code, "Name": name,
                 "D1_Close": int(close_p), "D1_Fluc": round(fluc, 2), "D1_Val_100M": round(val_d1 / 100000000, 1),
                 "Morning_Max_Ret": ret, "Win_3Pct": win,
-                "S1_거래대금TOP10": s1_pop, "S2_외국인순매수": s2_for, "S3_외국인3일연속": s3_for3,
+                "S1_인기검색TOP10": s1_pop, "S2_외국인순매수": s2_for, "S3_외국인3일연속": s3_for3,
                 "S4_기관순매수": s4_inst, "S5_기관3일연속": s5_inst3, "S6_신고가가시권": s6_high,
                 "S7_거래대금폭발": s7_vol, "S8_외인기관양매수": s8_twin, "S9_메이저수급집중": s9_major,
                 "S10_꽉찬양봉마감": s10_candle, "S11_이평선정배열": s11_trend, "S12_S급복합시그널": s12_scombo
@@ -175,13 +195,13 @@ def main():
 
     lines = [
         "# 🎯 트레이더 진 12대 시그널 주도주 역추적 승률 DB 성적표",
-        f"* **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST) | **분석 엔진:** Naver Official Mobile API",
+        f"* **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST) | **분석 엔진:** Naver Mobile API + Popular Search TOP 10",
         f"* **누적 검증 표본:** 총 **{total_samples:,}개** 주도주 (전일 거래대금 상위 40위)",
         f"* **전체 평균 성공률(Base Rate):** **{base_win_rate}%** (조건 없이 상위 40위 매수 시 익일 +3% 슈팅 도달 확률)\n",
         "---",
         "## 📊 1. 전일 시그널별 익일 +3% 슈팅 승률 랭킹 (Top 12)\n",
         "| 순위 | 전일(D-1) 발생 시그널 조건 | 누적 발생 횟수 | +3% 성공 건수 | **조건별 승률(%)** | 평균 최고상승률(%) |",
-        "| :---: | :--- | :---: | :---: | :---: | :---: |"
+        "| :---: | :--- | :---: | :---: | :---: | :--- |"
     ]
 
     stats = []
@@ -203,13 +223,14 @@ def main():
         df_c = chart_cache[code]
         cur = df_c.iloc[-1]
         inst_d1, for_d1 = inv_cache.get(code, {}).get(latest_day, (0, 0))
+        s1_pop = 1 if code in popular_set else 0
         s2_for = 1 if for_d1 > 0 else 0
         s4_inst = 1 if inst_d1 > 0 else 0
         s8_twin = 1 if (s2_for == 1 and s4_inst == 1) else 0
         s6_high = 1 if float(cur["Close"]) >= float(df_c["High"].iloc[-60:].max()) * 0.95 else 0
         s10_candle = 1 if (float(cur["Fluc"]) >= 3.0 and float(cur["Close"]) >= float(cur["High"]) * 0.98) else 0
-        sig_cnt = s2_for + s4_inst + s8_twin + s6_high + s10_candle
-        next_rows.append({"Rank": rank, "Name": universe.get(code, code), "Ticker": code, "Fluc": round(float(cur["Fluc"]), 2), "Sig_Count": sig_cnt, "For": s2_for, "Inst": s4_inst, "Twin": s8_twin, "High": s6_high, "Candle": s10_candle})
+        sig_cnt = s1_pop + s2_for + s4_inst + s8_twin + s6_high + s10_candle
+        next_rows.append({"Rank": rank, "Name": universe.get(code, code), "Ticker": code, "Fluc": round(float(cur["Fluc"]), 2), "Sig_Count": sig_cnt, "Pop": s1_pop, "For": s2_for, "Inst": s4_inst, "Twin": s8_twin, "High": s6_high, "Candle": s10_candle})
 
     next_df = pd.DataFrame(next_rows)
     if not next_df.empty:
@@ -218,6 +239,7 @@ def main():
         lines.append("| :---: | :--- | :---: | :---: | :--- |")
         for _, r in next_df.sort_values(by="Sig_Count", ascending=False).head(15).iterrows():
             traits = []
+            if r["Pop"]: traits.append("🔥인기검색TOP10")
             if r["Twin"]: traits.append("양매수")
             elif r["For"]: traits.append("외인순매수")
             elif r["Inst"]: traits.append("기관순매수")
