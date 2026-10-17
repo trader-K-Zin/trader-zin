@@ -107,7 +107,6 @@ def get_naver_chart_df(ticker, count=95):
 def get_investor_data(ticker):
     """외국인/기관 수급 데이터 수집 (1차 모바일 API + 2차 웹 테이블 이중 안전장치)"""
     inv_map = {}
-    # 1차: 모바일 JSON API 시도
     for page in [1, 2, 3]:
         url = f"https://m.stock.naver.com/api/stock/{ticker}/trend?page={page}&pageSize=20"
         try:
@@ -127,7 +126,6 @@ def get_investor_data(ticker):
         except Exception:
             pass
 
-    # 2차: 만약 모바일 API에서 빈 값이 왔다면 웹 테이블에서 직접 추출 (Fallback)
     if not inv_map:
         for page in [1, 2]:
             url = f"https://finance.naver.com/item/frgn.naver?code={ticker}&page={page}"
@@ -148,17 +146,27 @@ def get_investor_data(ticker):
     return inv_map
 
 def main():
-    print("Step 1: 종목 유니버스 및 영업일 로드 중...")
+    print("Step 1: 유니버스 및 영업일 로드 중...")
     universe = get_major_universe()
     if not universe:
-        print("유니버스 로드 실패")
         return
 
     df_ref = get_naver_chart_df("005930", count=75)
     if df_ref.empty:
-        print("기준 영업일 로드 실패")
         return
     trading_days = df_ref["Date"].tolist()[-55:]
+
+    # [핵심] 기존 누적 DB 파일 불러오기 (이미 수집된 날짜는 절대 중복 수집하지 않음)
+    if os.path.exists(DB_FILE):
+        try:
+            db_df = pd.read_csv(DB_FILE, dtype={"Ticker": str, "Base_Date": str})
+            existing_dates = set(db_df["Base_Date"].dropna().astype(str).unique())
+        except Exception:
+            db_df = pd.DataFrame()
+            existing_dates = set()
+    else:
+        db_df = pd.DataFrame()
+        existing_dates = set()
 
     print("Step 2: 개별 종목 일봉 차트 캐싱 중...")
     chart_cache = {}
@@ -167,16 +175,18 @@ def main():
         if not df_c.empty and len(df_c) >= 25:
             chart_cache[code] = df_c
 
-    # D+1과 D+2를 모두 평가하기 위해 최근 22거래일 역추적 (최신 2일은 D+1, D+2 검증용 여유분)
-    eval_days = trading_days[-24:-2]
+    # D+1, D+2까지 검증 가능한 날짜 범위 산정
+    possible_eval_days = trading_days[-24:-2]
+    # 기존 DB에 없는 날짜만 '신규 수집 대상'으로 필터링 (최초엔 22일치, 내일부터는 딱 하루치만 추가됨)
+    eval_days = [d for d in possible_eval_days if d not in existing_dates]
     latest_day = trading_days[-1]
 
-    # 날짜별 [등락률 +1% 이상 & 양봉(종가>시가)] 조건을 만족하는 거래대금 상위 40위 선정
     top40_by_day = {}
     top_vol_top10_by_day = {}
     tracked_tickers = set()
 
-    for d_str in eval_days + [latest_day]:
+    days_to_scan = list(set(eval_days + [latest_day]))
+    for d_str in days_to_scan:
         bullish_pool = []
         all_vol_pool = []
         for code, df_c in chart_cache.items():
@@ -187,7 +197,6 @@ def main():
                 fluc = float(r["Fluc"])
                 is_bull = bool(r["Is_Bullish"])
                 all_vol_pool.append((code, val * abs(fluc)))
-                # 핵심 기준: +1% 이상 오른 양봉 종목만 모수로 채택
                 if is_bull and fluc >= 1.0:
                     bullish_pool.append((code, val))
 
@@ -199,7 +208,7 @@ def main():
         top_vol_top10_by_day[d_str] = set([x[0] for x in all_vol_pool[:10]])
         tracked_tickers.update(selected_40)
 
-    print(f"Step 3: 엄선된 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터 수집 중...")
+    print(f"Step 3: 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터 수집 중...")
     inv_cache = {}
     for code in tracked_tickers:
         inv_cache[code] = get_investor_data(code)
@@ -207,119 +216,118 @@ def main():
 
     popular_now = get_popular_top10()
 
-    print("Step 4: 12대 시그널 판별 및 D+1 / D+2 단기스윙 성과 채점 중...")
-    records = []
+    new_records = []
+    if eval_days:
+        print(f"신규 평가 대상일({len(eval_days)}일치) 채점 시작...")
+        for d0_date in eval_days:
+            idx = trading_days.index(d0_date)
+            d_minus1 = trading_days[idx - 1]
+            d_minus2 = trading_days[idx - 2]
+            d_plus1 = trading_days[idx + 1]
+            d_plus2 = trading_days[idx + 2]
+            pop_proxies = top_vol_top10_by_day.get(d0_date, set())
 
-    for d0_date in eval_days:
-        idx = trading_days.index(d0_date)
-        d_minus1 = trading_days[idx - 1]
-        d_minus2 = trading_days[idx - 2]
-        d_plus1 = trading_days[idx + 1]
-        d_plus2 = trading_days[idx + 2]
+            for rank, code in enumerate(top40_by_day.get(d0_date, []), 1):
+                name = universe.get(code, code)
+                df_c = chart_cache[code]
+                df_until = df_c[df_c["Date"] <= d0_date]
+                if len(df_until) < 15:
+                    continue
 
-        pop_ proxies = top_vol_top10_by_day.get(d0_date, set())
+                cur = df_until.iloc[-1]
+                c0 = float(cur["Close"])
+                h0 = float(cur["High"])
+                fluc0 = float(cur["Fluc"])
+                val0 = float(cur["Val_Approx"])
+                if c0 <= 0:
+                    continue
 
-        for rank, code in enumerate(top40_by_day.get(d0_date, []), 1):
-            name = universe.get(code, code)
-            df_c = chart_cache[code]
-            df_until = df_c[df_c["Date"] <= d0_date]
-            if len(df_until) < 15:
-                continue
+                high_60d = float(df_until["High"].iloc[-60:].max())
+                avg_val_20d = float(df_until["Val_Approx"].iloc[-21:-1].mean()) if len(df_until) > 20 else val0
+                ma5 = float(df_until["Close"].iloc[-5:].mean())
+                ma20 = float(df_until["Close"].iloc[-20:].mean())
+                ma60 = float(df_until["Close"].iloc[-60:].mean()) if len(df_until) >= 60 else ma20
 
-            cur = df_until.iloc[-1]
-            c0 = float(cur["Close"])
-            h0 = float(cur["High"])
-            fluc0 = float(cur["Fluc"])
-            val0 = float(cur["Val_Approx"])
-            if c0 <= 0:
-                continue
+                inv_data = inv_cache.get(code, {})
+                inst_0, for_0 = inv_data.get(d0_date, (0.0, 0.0))
+                inst_m1, for_m1 = inv_data.get(d_minus1, (0.0, 0.0))
+                inst_m2, for_m2 = inv_data.get(d_minus2, (0.0, 0.0))
 
-            high_60d = float(df_until["High"].iloc[-60:].max())
-            avg_val_20d = float(df_until["Val_Approx"].iloc[-21:-1].mean()) if len(df_until) > 20 else val0
-            ma5 = float(df_until["Close"].iloc[-5:].mean())
-            ma20 = float(df_until["Close"].iloc[-20:].mean())
-            ma60 = float(df_until["Close"].iloc[-60:].mean()) if len(df_until) >= 60 else ma20
+                s1_pop = 1 if (code in popular_now or code in pop_proxies) else 0
+                s2_for = 1 if for_0 > 0 else 0
+                s3_for3 = 1 if (for_0 > 0 and for_m1 > 0 and for_m2 > 0) else 0
+                s4_inst = 1 if inst_0 > 0 else 0
+                s5_inst3 = 1 if (inst_0 > 0 and inst_m1 > 0 and inst_m2 > 0) else 0
+                s6_high = 1 if c0 >= high_60d * 0.95 else 0
+                s7_vol = 1 if (avg_val_20d > 0 and val0 >= avg_val_20d * 2.5) else 0
+                s8_twin = 1 if (s2_for == 1 and s4_inst == 1) else 0
+                s9_major = 1 if ((s2_for == 1 or s4_inst == 1) and val0 >= avg_val_20d * 1.5) else 0
+                s10_candle = 1 if (fluc0 >= 3.0 and h0 > 0 and c0 >= h0 * 0.98) else 0
+                s11_trend = 1 if (ma5 > ma20 > ma60) else 0
+                s12_scombo = 1 if (s8_twin == 1 and (s6_high == 1 or s10_candle == 1)) else 0
 
-            inv_data = inv_cache.get(code, {})
-            inst_0, for_0 = inv_data.get(d0_date, (0.0, 0.0))
-            inst_m1, for_m1 = inv_data.get(d_minus1, (0.0, 0.0))
-            inst_m2, for_m2 = inv_data.get(d_minus2, (0.0, 0.0))
+                sub_p1 = df_c[df_c["Date"] == d_plus1]
+                sub_p2 = df_c[df_c["Date"] == d_plus2]
+                if sub_p1.empty or sub_p2.empty:
+                    continue
 
-            # 12대 옵션 시그널 산출
-            s1_pop = 1 if (code in popular_now or code in pop_proxies) else 0
-            s2_for = 1 if for_0 > 0 else 0
-            s3_for3 = 1 if (for_0 > 0 and for_m1 > 0 and for_m2 > 0) else 0
-            s4_inst = 1 if inst_0 > 0 else 0
-            s5_inst3 = 1 if (inst_0 > 0 and inst_m1 > 0 and inst_m2 > 0) else 0
-            s6_high = 1 if c0 >= high_60d * 0.95 else 0
-            s7_vol = 1 if (avg_val_20d > 0 and val0 >= avg_val_20d * 2.5) else 0
-            s8_twin = 1 if (s2_for == 1 and s4_inst == 1) else 0
-            s9_major = 1 if ((s2_for == 1 or s4_inst == 1) and val0 >= avg_val_20d * 1.5) else 0
-            s10_candle = 1 if (fluc0 >= 3.0 and h0 > 0 and c0 >= h0 * 0.98) else 0
-            s11_trend = 1 if (ma5 > ma20 > ma60) else 0
-            s12_scombo = 1 if (s8_twin == 1 and (s6_high == 1 or s10_candle == 1)) else 0
+                h_p1 = float(sub_p1.iloc[0]["High"])
+                c_p1 = float(sub_p1.iloc[0]["Close"])
+                h_p2 = float(sub_p2.iloc[0]["High"])
+                c_p2 = float(sub_p2.iloc[0]["Close"])
 
-            # D+1 및 D+2 주가 추적
-            sub_p1 = df_c[df_c["Date"] == d_plus1]
-            sub_p2 = df_c[df_c["Date"] == d_plus2]
-            if sub_p1.empty or sub_p2.empty:
-                continue
+                d1_max_ret = round(((h_p1 - c0) / c0) * 100, 2)
+                d1_close_ret = round(((c_p1 - c0) / c0) * 100, 2)
+                d1_win_3pct = 1 if d1_max_ret >= 3.0 else 0
 
-            h_p1 = float(sub_p1.iloc[0]["High"])
-            c_p1 = float(sub_p1.iloc[0]["Close"])
-            h_p2 = float(sub_p2.iloc[0]["High"])
-            c_p2 = float(sub_p2.iloc[0]["Close"])
+                max_h_2days = max(h_p1, h_p2)
+                d2_swing_max_ret = round(((max_h_2days - c0) / c0) * 100, 2)
+                d2_only_max_ret = round(((h_p2 - c0) / c0) * 100, 2)
+                d2_close_ret = round(((c_p2 - c0) / c0) * 100, 2)
+                d2_win_3pct = 1 if d2_swing_max_ret >= 3.0 else 0
+                d2_win_5pct = 1 if d2_swing_max_ret >= 5.0 else 0
 
-            # 1) D+1 수익률 및 승률
-            d1_max_ret = round(((h_p1 - c0) / c0) * 100, 2)
-            d1_close_ret = round(((c_p1 - c0) / c0) * 100, 2)
-            d1_win_3pct = 1 if d1_max_ret >= 3.0 else 0
+                new_records.append({
+                    "Base_Date": d0_date,
+                    "D1_Date": d_plus1,
+                    "D2_Date": d_plus2,
+                    "Rank": rank,
+                    "Ticker": code,
+                    "Name": name,
+                    "Base_Close": int(c0),
+                    "Base_Fluc": round(fluc0, 2),
+                    "D1_Max_Ret": d1_max_ret,
+                    "D1_Close_Ret": d1_close_ret,
+                    "D1_Win_3Pct": d1_win_3pct,
+                    "D2_Swing_Max_Ret": d2_swing_max_ret,
+                    "D2_Only_Max_Ret": d2_only_max_ret,
+                    "D2_Close_Ret": d2_close_ret,
+                    "D2_Win_3Pct": d2_win_3pct,
+                    "D2_Win_5Pct": d2_win_5pct,
+                    "S1_인기검색TOP10": s1_pop,
+                    "S2_외국인순매수": s2_for,
+                    "S3_외국인3일연속": s3_for3,
+                    "S4_기관순매수": s4_inst,
+                    "S5_기관3일연속": s5_inst3,
+                    "S6_신고가가시권": s6_high,
+                    "S7_거래대금폭발": s7_vol,
+                    "S8_외인기관양매수": s8_twin,
+                    "S9_메이저수급집중": s9_major,
+                    "S10_꽉찬양봉마감": s10_candle,
+                    "S11_이평선정배열": s11_trend,
+                    "S12_S급복합시그널": s12_scombo
+                })
 
-            # 2) D+2 단기스윙 수익률 및 승률 (D+1 ~ D+2 이틀 보유 시 최고가 및 종가)
-            max_h_2days = max(h_p1, h_p2)
-            d2_swing_max_ret = round(((max_h_2days - c0) / c0) * 100, 2)
-            d2_only_max_ret = round(((h_p2 - c0) / c0) * 100, 2)
-            d2_close_ret = round(((c_p2 - c0) / c0) * 100, 2)
+        if new_records:
+            new_df = pd.DataFrame(new_records)
+            db_df = pd.concat([db_df, new_df], ignore_index=True)
+            db_df.drop_duplicates(subset=["Base_Date", "Ticker"], keep="last", inplace=True)
+            db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
+            print(f"신규 데이터 {len(new_records)}건이 영구 DB에 정상 누적되었습니다.")
 
-            d2_win_3pct = 1 if d2_swing_max_ret >= 3.0 else 0
-            d2_win_5pct = 1 if d2_swing_max_ret >= 5.0 else 0
-
-            records.append({
-                "Base_Date": d0_date,
-                "D1_Date": d_plus1,
-                "D2_Date": d_plus2,
-                "Rank": rank,
-                "Ticker": code,
-                "Name": name,
-                "Base_Close": int(c0),
-                "Base_Fluc": round(fluc0, 2),
-                "D1_Max_Ret": d1_max_ret,
-                "D1_Close_Ret": d1_close_ret,
-                "D1_Win_3Pct": d1_win_3pct,
-                "D2_Swing_Max_Ret": d2_swing_max_ret,
-                "D2_Only_Max_Ret": d2_only_max_ret,
-                "D2_Close_Ret": d2_close_ret,
-                "D2_Win_3Pct": d2_win_3pct,
-                "D2_Win_5Pct": d2_win_5pct,
-                "S1_인기검색TOP10": s1_pop,
-                "S2_외국인순매수": s2_for,
-                "S3_외국인3일연속": s3_for3,
-                "S4_기관순매수": s4_inst,
-                "S5_기관3일연속": s5_inst3,
-                "S6_신고가가시권": s6_high,
-                "S7_거래대금폭발": s7_vol,
-                "S8_외인기관양매수": s8_twin,
-                "S9_메이저수급집중": s9_major,
-                "S10_꽉찬양봉마감": s10_candle,
-                "S11_이평선정배열": s11_trend,
-                "S12_S급복합시그널": s12_scombo
-            })
-
-    db_df = pd.DataFrame(records)
     if db_df.empty:
-        print("생성된 레코드가 없습니다.")
+        print("DB에 데이터가 없습니다.")
         return
-    db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
 
     signal_cols = [c for c in db_df.columns if c.startswith("S")]
     total_cnt = len(db_df)
@@ -333,7 +341,7 @@ def main():
         "# 🎯 트레이더 진 주도주(+1% 양봉) 단타(D+1) & 단기스윙(D+2) 승률 DB 성적표",
         f"- **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST)",
         f"- **모수(Base) 기준:** 거래대금 상위권 중 **등락률 +1.0% 이상 양봉 마감** 순수 개별주 (ETF 제외)",
-        f"- **누적 검증 표본:** 총 **{total_cnt:,}개** 양봉 주도주\n",
+        f"- **영구 누적 검증 표본:** 총 **{total_cnt:,}개** 양봉 주도주\n",
         "## 📌 0. 아무 옵션 없이 '+1% 이상 양봉 주도주' 매수 시 기본(Base) 확률",
         "| 전략 구분 | +3% 슈팅 승률 | +5% 슈팅 승률 | 평균 최고상승률 | 전략 코멘트 |",
         "| :--- | :---: | :---: | :---: | :--- |",
@@ -360,7 +368,6 @@ def main():
         s_name = col.split("_", 1)[1]
         stats.append((s_name, cnt, w_d1, r_d1, w_d2_3, w_d2_5, r_d2))
 
-    # D+1 승률 기준 내림차순 정렬 (동률 시 D+2 승률 우선)
     stats.sort(key=lambda x: (x[2], x[4]), reverse=True)
     for idx, (s_name, cnt, w_d1, r_d1, w_d2_3, w_d2_5, r_d2) in enumerate(stats, 1):
         row_str = (
@@ -370,7 +377,6 @@ def main():
         )
         lines.append(row_str)
 
-    # 최근 마감일 기준 -> 다음 거래일(D+1 & D+2) 공략 후보 리스트
     next_rows = []
     d_m1 = trading_days[-2]
     d_m2 = trading_days[-3]
