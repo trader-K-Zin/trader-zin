@@ -11,7 +11,6 @@ REPORT_FILE = "WIN_RATE_REPORT.md"
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
 def get_major_universe():
-    """네이버 금융 공식 JSON API를 통해 코스피/코스닥 상위 핵심 주도주 코드 및 종목명 확보"""
     tickers = {}
     for market in ["KOSPI", "KOSDAQ"]:
         for page in [1, 2, 3]:
@@ -19,11 +18,8 @@ def get_major_universe():
             try:
                 res = requests.get(url, headers=HEADERS, timeout=10)
                 if res.status_code == 200:
-                    data = res.json()
-                    stocks = data.get("stocks", [])
-                    for s in stocks:
-                        code = s.get("itemCode")
-                        name = s.get("stockName")
+                    for s in res.json().get("stocks", []):
+                        code, name = s.get("itemCode"), s.get("stockName")
                         if code and name:
                             tickers[code] = name
             except Exception:
@@ -31,17 +27,15 @@ def get_major_universe():
     return tickers
 
 def get_naver_chart_df(ticker, count=90):
-    """네이버 차트 XML API로 일봉 데이터 가져오기"""
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={ticker}&timeframe=day&count={count}&requestType=0"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         root = ET.fromstring(res.text)
         rows = []
         for item in root.findall('.//item'):
-            data = item.attrib['data'].split('|')
-            if len(data) >= 6:
-                dt, o, h, l, c, v = data[0], float(data[1]), float(data[2]), float(data[3]), float(data[4]), float(data[5])
-                rows.append({"Date": dt, "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
+            d = item.attrib['data'].split('|')
+            if len(d) >= 6:
+                rows.append({"Date": d[0], "Open": float(d[1]), "High": float(d[2]), "Low": float(d[3]), "Close": float(d[4]), "Volume": float(d[5])})
         df = pd.DataFrame(rows)
         if not df.empty:
             df["Prev_Close"] = df["Close"].shift(1)
@@ -51,8 +45,16 @@ def get_naver_chart_df(ticker, count=90):
     except Exception:
         return pd.DataFrame()
 
+def to_float(val):
+    if val is None:
+        return 0.0
+    s = str(val).replace(",", "").replace("+", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 def get_investor_data(ticker):
-    """네이버 모바일 증권 공식 JSON API를 통해 과거 외국인/기관 순매수 수량 100% 정확하게 수집"""
     inv_map = {}
     for page in [1, 2, 3]:
         url = f"https://m.stock.naver.com/api/stock/{ticker}/trend?page={page}&pageSize=20"
@@ -60,73 +62,62 @@ def get_investor_data(ticker):
             res = requests.get(url, headers=HEADERS, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                # API 응답 구조: [{bizdate: '20261016', foreignerPureBuyQuant: '12345', organPureBuyQuant: '-5432'}, ...]
-                trends = data if isinstance(data, list) else data.get("message", {}).get("result", [])
-                if not trends and isinstance(data, dict):
-                    trends = data.get("item", []) or data.get("trend", [])
+                trends = data if isinstance(data, list) else data.get("trends", data.get("item", []))
                 for item in trends:
-                    b_date = str(item.get("bizdate", "")).replace("-", "").strip()
+                    if not isinstance(item, dict):
+                        continue
+                    b_date = str(item.get("bizdate", "")).replace("-", "").replace(".", "").strip()
                     if len(b_date) == 8:
-                        f_quant = float(str(item.get("foreignerPureBuyQuant", 0)).replace(",", ""))
-                        o_quant = float(str(item.get("organPureBuyQuant", 0)).replace(",", ""))
-                        inv_map[b_date] = (o_quant, f_quant)
+                        f_q = to_float(item.get("foreignerPureBuyQuant", 0))
+                        o_q = to_float(item.get("organPureBuyQuant", 0))
+                        inv_map[b_date] = (o_q, f_q)
         except Exception:
             pass
     return inv_map
 
 def main():
-    print("1. 네이버 금융 공식 API로 시장 주도주 로드 중...")
     universe = get_major_universe()
     if not universe:
-        print("종목 데이터를 가져오지 못했습니다.")
         return
-
     df_ref = get_naver_chart_df("005930", count=70)
     if df_ref.empty:
         return
     trading_days = df_ref["Date"].tolist()[-50:]
 
-    print(f"2. {len(universe)}개 핵심 종목의 일봉 차트 데이터 캐싱 중...")
     chart_cache = {}
     for code in universe.keys():
         df_c = get_naver_chart_df(code, count=85)
         if not df_c.empty and len(df_c) >= 20:
             chart_cache[code] = df_c
 
-    # 최근 20거래일 집중 역추적 (800개 표본)
     eval_days = trading_days[-22:-1]
-
     top40_by_day = {}
     tracked_tickers = set()
+
     for d_str in eval_days + [trading_days[-1]]:
         day_pool = []
         for code, df_c in chart_cache.items():
             sub = df_c[df_c["Date"] == d_str]
             if not sub.empty:
-                val = float(sub.iloc[0]["Val_Approx"])
-                day_pool.append((code, val))
+                day_pool.append((code, float(sub.iloc[0]["Val_Approx"])))
         day_pool.sort(key=lambda x: x[1], reverse=True)
         selected = [x[0] for x in day_pool[:40]]
         top40_by_day[d_str] = selected
         tracked_tickers.update(selected)
 
-    print(f"3. 주도주 {len(tracked_tickers)}개의 외인/기관 모바일 API 수급 로드 중...")
     inv_cache = {}
     for code in tracked_tickers:
         inv_cache[code] = get_investor_data(code)
         time.sleep(0.02)
 
-    print("4. 12대 시그널 판별 및 익일 +3% 슈팅 역추적 채점 시작...")
     records = []
-
     for d1_date in eval_days:
         idx = trading_days.index(d1_date)
         d_day = trading_days[idx + 1]
         d2_date = trading_days[idx - 1]
         d3_date = trading_days[idx - 2]
-        codes = top40_by_day.get(d1_date, [])
 
-        for rank, code in enumerate(codes, 1):
+        for rank, code in enumerate(top40_by_day.get(d1_date, []), 1):
             name = universe.get(code, code)
             df_c = chart_cache[code]
             df_until = df_c[df_c["Date"] <= d1_date]
@@ -134,11 +125,7 @@ def main():
                 continue
 
             cur = df_until.iloc[-1]
-            close_p = float(cur["Close"])
-            high_p = float(cur["High"])
-            fluc = float(cur["Fluc"])
-            val_d1 = float(cur["Val_Approx"])
-
+            close_p, high_p, fluc, val_d1 = float(cur["Close"]), float(cur["High"]), float(cur["Fluc"]), float(cur["Val_Approx"])
             high_60d = float(df_until["High"].iloc[-60:].max())
             avg_val_20d = float(df_until["Val_Approx"].iloc[-21:-1].mean()) if len(df_until) > 20 else val_d1
             ma5 = float(df_until["Close"].iloc[-5:].mean())
@@ -150,7 +137,6 @@ def main():
             inst_d2, for_d2 = inv_data.get(d2_date, (0, 0))
             inst_d3, for_d3 = inv_data.get(d3_date, (0, 0))
 
-            # 12대 시그널 정상 판별
             s1_pop = 1 if rank <= 10 else 0
             s2_for = 1 if for_d1 > 0 else 0
             s3_for3 = 1 if (for_d1 > 0 and for_d2 > 0 and for_d3 > 0) else 0
@@ -165,44 +151,22 @@ def main():
             s12_scombo = 1 if (s8_twin == 1 and s6_high == 1 and s10_candle == 1) else 0
 
             sub_next = df_c[df_c["Date"] == d_day]
-            if not sub_next.empty and close_p > 0:
-                high_next = float(sub_next.iloc[0]["High"])
-                ret = round(((high_next - close_p) / close_p) * 100, 2)
-            else:
-                ret = 0.0
-
+            ret = round(((float(sub_next.iloc[0]["High"]) - close_p) / close_p) * 100, 2) if (not sub_next.empty and close_p > 0) else 0.0
             win = 1 if ret >= 3.0 else 0
 
             records.append({
-                "D1_Date": d1_date,
-                "D_Day": d_day,
-                "Rank": rank,
-                "Ticker": code,
-                "Name": name,
-                "D1_Close": int(close_p),
-                "D1_Fluc": round(fluc, 2),
-                "D1_Val_100M": round(val_d1 / 100000000, 1),
-                "Morning_Max_Ret": ret,
-                "Win_3Pct": win,
-                "S1_거래대금TOP10": s1_pop,
-                "S2_외국인순매수": s2_for,
-                "S3_외국인3일연속": s3_for3,
-                "S4_기관순매수": s4_inst,
-                "S5_기관3일연속": s5_inst3,
-                "S6_신고가가시권": s6_high,
-                "S7_거래대금폭발": s7_vol,
-                "S8_외인기관양매수": s8_twin,
-                "S9_메이저수급집중": s9_major,
-                "S10_꽉찬양봉마감": s10_candle,
-                "S11_이평선정배열": s11_trend,
-                "S12_S급복합시그널": s12_scombo
+                "D1_Date": d1_date, "D_Day": d_day, "Rank": rank, "Ticker": code, "Name": name,
+                "D1_Close": int(close_p), "D1_Fluc": round(fluc, 2), "D1_Val_100M": round(val_d1 / 100000000, 1),
+                "Morning_Max_Ret": ret, "Win_3Pct": win,
+                "S1_거래대금TOP10": s1_pop, "S2_외국인순매수": s2_for, "S3_외국인3일연속": s3_for3,
+                "S4_기관순매수": s4_inst, "S5_기관3일연속": s5_inst3, "S6_신고가가시권": s6_high,
+                "S7_거래대금폭발": s7_vol, "S8_외인기관양매수": s8_twin, "S9_메이저수급집중": s9_major,
+                "S10_꽉찬양봉마감": s10_candle, "S11_이평선정배열": s11_trend, "S12_S급복합시그널": s12_scombo
             })
 
     db_df = pd.DataFrame(records)
     if db_df.empty:
-        print("기록된 데이터가 없습니다.")
         return
-
     db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
 
     signal_cols = [c for c in db_df.columns if c.startswith("S")]
@@ -210,8 +174,8 @@ def main():
     base_win_rate = round(db_df["Win_3Pct"].mean() * 100, 1) if total_samples > 0 else 0.0
 
     lines = [
-        f"# 🎯 트레이더 진 12대 시그널 주도주 역추적 승률 DB 성적표",
-        f"* **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST) | **분석 엔진:** Naver Official Mobile API (수급 100% 정상화)",
+        "# 🎯 트레이더 진 12대 시그널 주도주 역추적 승률 DB 성적표",
+        f"* **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST) | **분석 엔진:** Naver Official Mobile API",
         f"* **누적 검증 표본:** 총 **{total_samples:,}개** 주도주 (전일 거래대금 상위 40위)",
         f"* **전체 평균 성공률(Base Rate):** **{base_win_rate}%** (조건 없이 상위 40위 매수 시 익일 +3% 슈팅 도달 확률)\n",
         "---",
@@ -227,35 +191,25 @@ def main():
         wins = int(sub["Win_3Pct"].sum()) if cnt > 0 else 0
         w_rate = round((wins / cnt) * 100, 1) if cnt > 0 else 0.0
         avg_ret = round(sub["Morning_Max_Ret"].mean(), 2) if cnt > 0 else 0.0
-        clean_name = col.split("_", 1)[1]
-        stats.append((clean_name, cnt, wins, w_rate, avg_ret))
+        stats.append((col.split("_", 1)[1], cnt, wins, w_rate, avg_ret))
 
     stats.sort(key=lambda x: x[3], reverse=True)
     for idx, (s_name, cnt, wins, w_rate, avg_ret) in enumerate(stats, 1):
         lines.append(f"| {idx}위 | **{s_name}** | {cnt:,}건 | {wins:,}건 | **{w_rate}%** | +{avg_ret}% |")
 
-    # 최근 거래일 마감 기준 -> 다음 거래일 오전 타점 후보 리스트
     latest_day = trading_days[-1]
-    latest_codes = top40_by_day.get(latest_day, [])
     next_rows = []
-    for rank, code in enumerate(latest_codes, 1):
+    for rank, code in enumerate(top40_by_day.get(latest_day, []), 1):
         df_c = chart_cache[code]
         cur = df_c.iloc[-1]
-        inv_data = inv_cache.get(code, {})
-        inst_d1, for_d1 = inv_data.get(latest_day, (0, 0))
+        inst_d1, for_d1 = inv_cache.get(code, {}).get(latest_day, (0, 0))
         s2_for = 1 if for_d1 > 0 else 0
         s4_inst = 1 if inst_d1 > 0 else 0
         s8_twin = 1 if (s2_for == 1 and s4_inst == 1) else 0
-        high_60d = float(df_c["High"].iloc[-60:].max())
-        s6_high = 1 if float(cur["Close"]) >= high_60d * 0.95 else 0
+        s6_high = 1 if float(cur["Close"]) >= float(df_c["High"].iloc[-60:].max()) * 0.95 else 0
         s10_candle = 1 if (float(cur["Fluc"]) >= 3.0 and float(cur["Close"]) >= float(cur["High"]) * 0.98) else 0
-        
-        sig_count = s2_for + s4_inst + s8_twin + s6_high + s10_candle
-        next_rows.append({
-            "Rank": rank, "Name": universe.get(code, code), "Ticker": code,
-            "Fluc": round(float(cur["Fluc"]), 2), "Sig_Count": sig_count,
-            "For": s2_for, "Inst": s4_inst, "Twin": s8_twin, "High": s6_high, "Candle": s10_candle
-        })
+        sig_cnt = s2_for + s4_inst + s8_twin + s6_high + s10_candle
+        next_rows.append({"Rank": rank, "Name": universe.get(code, code), "Ticker": code, "Fluc": round(float(cur["Fluc"]), 2), "Sig_Count": sig_cnt, "For": s2_for, "Inst": s4_inst, "Twin": s8_twin, "High": s6_high, "Candle": s10_candle})
 
     next_df = pd.DataFrame(next_rows)
     if not next_df.empty:
@@ -269,5 +223,12 @@ def main():
             elif r["Inst"]: traits.append("기관순매수")
             if r["High"]: traits.append("신고가도전")
             if r["Candle"]: traits.append("종가고가마감")
-            trait_str = ", ".join(traits) if traits else "거래대금 상위"
-            lines.append(f"| {r
+            t_str = ", ".join(traits) if traits else "거래대금 상위"
+            r_rk, r_nm, r_tk, r_fl, r_sc = r["Rank"], r["Name"], r["Ticker"], r["Fluc"], r["Sig_Count"]
+            lines.append(f"| {r_rk}위 | **{r_nm}** ({r_tk}) | {r_fl}% | **{r_sc}개** | {t_str} |")
+
+    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+if __name__ == "__main__":
+    main()
