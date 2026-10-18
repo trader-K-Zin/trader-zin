@@ -37,6 +37,19 @@ def to_float(val):
     except Exception:
         return 0.0
 
+def get_market_regime(date_str):
+    """날짜별 시장 국면(4~5월 상승, 6~7월 하락, 8~9월 횡보, 10월~ 하락) 분류"""
+    ym = str(date_str)[:6]
+    if ym in ("202604", "202605"):
+        return "1_4~5월_상승장"
+    elif ym in ("202606", "202607"):
+        return "2_6~7월_하락장"
+    elif ym in ("202608", "202609"):
+        return "3_8~9월_횡보장"
+    elif ym >= "202610":
+        return "4_10월_하락장"
+    return "0_기타기간"
+
 def get_popular_top10():
     """네이버 금융 실시간 인기 검색어 TOP 10 티커 추출"""
     top10 = set()
@@ -76,8 +89,8 @@ def get_major_universe():
                 pass
     return tickers
 
-def get_naver_chart_df(ticker, count=95):
-    """네이버 공식 XML 차트 API로 과거 일봉 로드"""
+def get_naver_chart_df(ticker, count=210):
+    """4월 초 데이터 및 60일선 계산을 위해 최근 210거래일 일봉 로드"""
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={ticker}&timeframe=day&count={count}&requestType=0"
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
@@ -104,10 +117,10 @@ def get_naver_chart_df(ticker, count=95):
     except Exception:
         return pd.DataFrame()
 
-def get_investor_data(ticker):
-    """외국인/기관 수급 데이터 수집 (1차 모바일 API + 2차 웹 테이블 이중 안전장치)"""
+def get_investor_data(ticker, max_pages=8):
+    """4월~10월(약 140거래일) 커버를 위해 모바일 API 8페이지(160일치) 수급 로드"""
     inv_map = {}
-    for page in [1, 2, 3]:
+    for page in range(1, max_pages + 1):
         url = f"https://m.stock.naver.com/api/stock/{ticker}/trend?page={page}&pageSize=20"
         try:
             res = requests.get(url, headers=HEADERS, timeout=6)
@@ -127,7 +140,7 @@ def get_investor_data(ticker):
             pass
 
     if not inv_map:
-        for page in [1, 2]:
+        for page in range(1, 8):
             url = f"https://finance.naver.com/item/frgn.naver?code={ticker}&page={page}"
             try:
                 res = requests.get(url, headers=HEADERS, timeout=6)
@@ -146,7 +159,6 @@ def get_investor_data(ticker):
     return inv_map
 
 def extract_stock_traits(code, rank, target_day, d_m1, d_m2, chart_cache, inv_cache, popular_now):
-    """특정 기준일(D0)에 포착된 주도주의 시그널 및 이후 주가 흐름 요약"""
     df_c = chart_cache[code]
     df_until = df_c[df_c["Date"] <= target_day]
     cur = df_until.iloc[-1]
@@ -205,22 +217,23 @@ def extract_stock_traits(code, rank, target_day, d_m1, d_m2, chart_cache, inv_ca
     }
 
 def main():
-    print("Step 1: 유니버스 및 영업일 로드 중...")
+    print("Step 1: 유니버스 및 2026년 4월~10월 전체 영업일 로드 중...")
     universe = get_major_universe()
     if not universe:
         return
 
-    df_ref = get_naver_chart_df("005930", count=80)
+    df_ref = get_naver_chart_df("005930", count=210)
     if df_ref.empty:
         return
-    trading_days = df_ref["Date"].tolist()[-60:]
+    all_days = df_ref["Date"].tolist()
 
-    # 기존 DB 확인 (새 구조인 Bet3_Win_3Pct 컬럼이 없으면 자동으로 새 구조로 초기화)
+    # 기존 DB 확인: 2026년 4월 데이터(Regime 포함)가 없으면 4월~10월 전체 1회 통합 구축
     if os.path.exists(DB_FILE):
         try:
             db_df = pd.read_csv(DB_FILE, dtype={"Ticker": str, "Base_Date": str})
-            if "Bet3_Win_3Pct" not in db_df.columns:
-                print("신규 릴레이 종가베팅(1·2·3차) 구조 적용을 위해 DB를 재구축합니다.")
+            has_april = any(str(d).startswith("202604") for d in db_df["Base_Date"].dropna().unique())
+            if "Regime" not in db_df.columns or not has_april:
+                print("4월~10월 전 구간(상승/하락/횡보장) 통합 DB 구축을 위해 전체 역추적을 시작합니다.")
                 db_df = pd.DataFrame()
                 existing_dates = set()
             else:
@@ -232,26 +245,26 @@ def main():
         db_df = pd.DataFrame()
         existing_dates = set()
 
-    print("Step 2: 개별 종목 일봉 차트 캐싱 중...")
+    print("Step 2: 개별 종목 210일 일봉 차트 캐싱 중...")
     chart_cache = {}
     for code in universe.keys():
-        df_c = get_naver_chart_df(code, count=90)
-        if not df_c.empty and len(df_c) >= 30:
+        df_c = get_naver_chart_df(code, count=210)
+        if not df_c.empty and len(df_c) >= 60:
             chart_cache[code] = df_c
 
-    # D0 기준 D+1, D+2, D+3까지 총 3번의 종가베팅 결과를 모두 채점하려면 최소 3거래일 여유 필요
-    possible_eval_days = trading_days[-25:-3]
+    # 2026년 4월 1일(20260401) 이후부터 D+3 검증 가능한 날짜까지 모두 평가 대상에 포함
+    possible_eval_days = [d for d in all_days[:-3] if d >= "20260401"]
     eval_days = [d for d in possible_eval_days if d not in existing_dates]
 
-    day_0_latest = trading_days[-1]
-    day_m1_latest = trading_days[-2]
-    day_m2_latest = trading_days[-3]
+    day_0_latest = all_days[-1]
+    day_m1_latest = all_days[-2]
+    day_m2_latest = all_days[-3]
 
     top40_by_day = {}
     top_vol_top10_by_day = {}
     tracked_tickers = set()
 
-    days_to_scan = list(set(eval_days + [day_0_latest, day_m1_latest, day_m2_latest]))
+    days_to_scan = sorted(list(set(eval_days + [day_0_latest, day_m1_latest, day_m2_latest])))
     for d_str in days_to_scan:
         bullish_pool = []
         all_vol_pool = []
@@ -274,31 +287,36 @@ def main():
         top_vol_top10_by_day[d_str] = set([x[0] for x in all_vol_pool[:10]])
         tracked_tickers.update(selected_40)
 
-    print(f"Step 3: 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터 수집 중...")
+    # 최초 6개월 전체 수집 시에는 8페이지(160일), 평상시 일일 추가 시에는 2페이지(40일)만 빠르게 조회
+    pages_to_fetch = 8 if len(eval_days) > 10 else 2
+    print(f"Step 3: 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
     inv_cache = {}
     for code in tracked_tickers:
-        inv_cache[code] = get_investor_data(code)
-        time.sleep(0.02)
+        inv_cache[code] = get_investor_data(code, max_pages=pages_to_fetch)
+        time.sleep(0.01)
 
     popular_now = get_popular_top10()
 
     new_records = []
     if eval_days:
-        print(f"신규 평가 대상일({len(eval_days)}일치) 1·2·3차 종가베팅 채점 시작...")
+        print(f"신규 평가 대상일({len(eval_days)}거래일) 1·2·3차 종가베팅 채점 시작...")
         for d0_date in eval_days:
-            idx = trading_days.index(d0_date)
-            d_minus1 = trading_days[idx - 1]
-            d_minus2 = trading_days[idx - 2]
-            d_plus1 = trading_days[idx + 1]
-            d_plus2 = trading_days[idx + 2]
-            d_plus3 = trading_days[idx + 3]
+            idx = all_days.index(d0_date)
+            if idx < 2 or idx + 3 >= len(all_days):
+                continue
+            d_minus1 = all_days[idx - 1]
+            d_minus2 = all_days[idx - 2]
+            d_plus1 = all_days[idx + 1]
+            d_plus2 = all_days[idx + 2]
+            d_plus3 = all_days[idx + 3]
             pop_proxies = top_vol_top10_by_day.get(d0_date, set())
+            regime_label = get_market_regime(d0_date)
 
             for rank, code in enumerate(top40_by_day.get(d0_date, []), 1):
                 name = universe.get(code, code)
                 df_c = chart_cache[code]
                 df_until = df_c[df_c["Date"] <= d0_date]
-                if len(df_until) < 15:
+                if len(df_until) < 20:
                     continue
 
                 cur = df_until.iloc[-1]
@@ -320,7 +338,6 @@ def main():
                 inst_m1, for_m1 = inv_data.get(d_minus1, (0.0, 0.0))
                 inst_m2, for_m2 = inv_data.get(d_minus2, (0.0, 0.0))
 
-                # 12대 옵션 시그널 (D0 기준)
                 s1_pop = 1 if (code in popular_now or code in pop_proxies) else 0
                 s2_for = 1 if for_0 > 0 else 0
                 s3_for3 = 1 if (for_0 > 0 and for_m1 > 0 and for_m2 > 0) else 0
@@ -334,7 +351,6 @@ def main():
                 s11_trend = 1 if (ma5 > ma20 > ma60) else 0
                 s12_scombo = 1 if (s8_twin == 1 and (s6_high == 1 or s10_candle == 1)) else 0
 
-                # D+1, D+2, D+3 일봉 데이터 확인
                 sub_p1 = df_c[df_c["Date"] == d_plus1]
                 sub_p2 = df_c[df_c["Date"] == d_plus2]
                 sub_p3 = df_c[df_c["Date"] == d_plus3]
@@ -347,20 +363,18 @@ def main():
                 if c_p1 <= 0 or c_p2 <= 0:
                     continue
 
-                # [1차 종가베팅] D0 종가 매수 -> D+1 오전(장중 고가) 매도
                 bet1_ret = round(((h_p1 - c0) / c0) * 100, 2)
                 bet1_win = 1 if bet1_ret >= 3.0 else 0
 
-                # [2차 종가베팅] D+1 종가 매수(조건 무관) -> D+2 오전(장중 고가) 매도
                 bet2_ret = round(((h_p2 - c_p1) / c_p1) * 100, 2)
                 bet2_win = 1 if bet2_ret >= 3.0 else 0
 
-                # [3차 종가베팅] D+2 종가 매수(조건 무관) -> D+3 오전(장중 고가) 매도
                 bet3_ret = round(((h_p3 - c_p2) / c_p2) * 100, 2)
                 bet3_win = 1 if bet3_ret >= 3.0 else 0
 
                 new_records.append({
                     "Base_Date": d0_date,
+                    "Regime": regime_label,
                     "D1_Date": d_plus1,
                     "D2_Date": d_plus2,
                     "D3_Date": d_plus3,
@@ -395,6 +409,7 @@ def main():
             new_df = pd.DataFrame(new_records)
             db_df = pd.concat([db_df, new_df], ignore_index=True)
             db_df.drop_duplicates(subset=["Base_Date", "Ticker"], keep="last", inplace=True)
+            db_df.sort_values(by=["Base_Date", "Rank"], ascending=[True, True], inplace=True)
             db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
             print(f"신규 데이터 {len(new_records)}건이 영구 DB에 정상 누적되었습니다.")
 
@@ -402,8 +417,11 @@ def main():
         print("DB에 데이터가 없습니다.")
         return
 
+    db_df["Regime"] = db_df["Base_Date"].astype(str).apply(get_market_regime)
     signal_cols = [c for c in db_df.columns if c.startswith("S")]
     total_cnt = len(db_df)
+    min_dt = db_df["Base_Date"].min()
+    max_dt = db_df["Base_Date"].max()
 
     b1_win = round(db_df["Bet1_Win_3Pct"].mean() * 100, 1)
     b1_ret = round(db_df["Bet1_Max_Ret"].mean(), 2)
@@ -413,21 +431,46 @@ def main():
     b3_ret = round(db_df["Bet3_Max_Ret"].mean(), 2)
 
     lines = [
-        "# 🎯 트레이더 진 주도주 릴레이 종가베팅(1차·2차·3차) 승률 DB 성적표",
+        "# 🎯 트레이더 진 주도주 릴레이 종가베팅(1·2·3차) 전 구간(4~10월) 승률 DB 성적표",
         f"- **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST)",
+        f"- **검증 기간:** `{min_dt}` ~ `{max_dt}` (4~5월 상승장 / 6~7월 하락장 / 8~9월 횡보장 / 10월 하락장 통합)",
         f"- **모수(Base) 기준:** `D0` 거래대금 상위권 중 **등락률 +1.0% 이상 양봉 마감** 순수 개별주 (ETF 제외)",
         f"- **영구 누적 검증 표본:** 총 **{total_cnt:,}개** 양봉 주도주\n",
-        "## 📌 0. 아무 추가 옵션 없이 '+1% 양봉 주도주' 연속 종가베팅 시 기본(Base) 확률",
+        "## 📌 0-1. 전체 통합 기간(4월~10월) 연속 종가베팅 기본(Base) 확률",
         "| 종가베팅 차수 | 진입 시점 (종가 매수) | 청산 시점 (오전 10시 전) | **+3% 슈팅 승률** | 평균 최고상승률 | 전략적 의미 |",
         "| :--- | :---: | :---: | :---: | :---: | :--- |",
         f"| **1차 종가베팅 (메인)** | **`D0` 종가** | **`D+1` 오전** | **{b1_win}%** | +{b1_ret}% | 주도주 발생 당일 종가베팅 -> 익일 오전 매도 |",
         f"| **2차 종가베팅 (D+1)** | **`D+1` 종가** | **`D+2` 오전** | **{b2_win}%** | +{b2_ret}% | D+1 양봉/대금 무관 종가 재진입 -> D+2 오전 매도 |",
         f"| **3차 종가베팅 (D+2)** | **`D+2` 종가** | **`D+3` 오전** | **{b3_win}%** | +{b3_ret}% | D+2 양봉/대금 무관 종가 재진입 -> D+3 오전 매도 |\n",
-        "---",
-        "## 📊 1. D0 시그널 옵션별 [1차 vs 2차 vs 3차 릴레이 종가베팅] +3% 승률 비교",
-        "| 순위 | D0 발생 옵션 (시그널) | 표본 수 | **1차 종베 승률(D0➔D1)** | 1차 최고 | **2차 종베 승률(D1➔D2)** | 2차 최고 | **3차 종베 승률(D2➔D3)** | 3차 최고 |",
-        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "## 📈 0-2. 시장 시황 국면별(상승장 vs 하락장 vs 횡보장) 승률 비교",
+        "| 시장 시황 국면 | 검증 표본 수 | **1차 종베 승률(D0➔D1)** | **2차 종베 승률(D1➔D2)** | **3차 종베 승률(D2➔D3)** | **대금폭발(1위 옵션) 2차 종베 승률** |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: |"
     ]
+
+    regime_names = {
+        "1_4~5월_상승장": "🔥 **4~5월 상승장** (04.01~05.31)",
+        "2_6~7월_하락장": "☔ **6~7월 하락장** (06.01~07.31)",
+        "3_8~9월_횡보장": "⚖️ **8~9월 횡보장** (08.01~09.30)",
+        "4_10월_하락장": "❄️ **10월 하락장** (10.01~현재)"
+    }
+
+    for r_key in sorted(regime_names.keys()):
+        sub_r = db_df[db_df["Regime"] == r_key]
+        r_cnt = len(sub_r)
+        if r_cnt > 0:
+            rw1 = round(sub_r["Bet1_Win_3Pct"].mean() * 100, 1)
+            rw2 = round(sub_r["Bet2_Win_3Pct"].mean() * 100, 1)
+            rw3 = round(sub_r["Bet3_Win_3Pct"].mean() * 100, 1)
+            sub_vol = sub_r[sub_r["S7_거래대금폭발"] == 1]
+            vol_w2 = round(sub_vol["Bet2_Win_3Pct"].mean() * 100, 1) if len(sub_vol) > 0 else 0.0
+            lines.append(f"| {regime_names[r_key]} | {r_cnt:,}건 | **{rw1}%** | **{rw2}%** | **{rw3}%** | **{vol_w2}%** |")
+
+    lines.extend([
+        "\n---",
+        "## 📊 1. D0 시그널 옵션별 [1차 vs 2차 vs 3차 릴레이 종가베팅] 통합 승률 랭킹 (4~10월 누적)",
+        "| 순위 | D0 발생 옵션 (시그널) | 누적 표본 | **1차 종베 승률(D0➔D1)** | 1차 최고 | **2차 종베 승률(D1➔D2)** | 2차 최고 | **3차 종베 승률(D2➔D3)** | 3차 최고 |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+    ])
 
     stats = []
     for col in signal_cols:
@@ -455,10 +498,8 @@ def main():
         )
         lines.append(row_str)
 
-    # 실전 타점 후보: 1차(오늘 D0 발생), 2차(어제 D-1 발생 -> 오늘 D+1 종베), 3차(그저께 D-2 발생 -> 오늘 D+2 종베)
     lines.append(f"\n---\n## 🚀 2. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 종가베팅 실전 리스트\n")
 
-    # (A) 1차 종가베팅 후보 (오늘 D0 발생 주도주)
     rows_bet1 = []
     for rank, code in enumerate(top40_by_day.get(day_0_latest, []), 1):
         info = extract_stock_traits(code, rank, day_0_latest, day_m1_latest, day_m2_latest, chart_cache, inv_cache, popular_now)
@@ -473,9 +514,8 @@ def main():
         for _, r in df_b1.sort_values(by=["Sig_Count", "Base_Fluc"], ascending=[False, False]).head(10).iterrows():
             lines.append(f"| {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{r['Sig_Count']}개** | {r['Traits']} |")
 
-    # (B) 2차 종가베팅 후보 (어제 D-1 발생 주도주 -> 오늘 D+1 종가 재진입)
     rows_bet2 = []
-    d_m3_latest = trading_days[-4]
+    d_m3_latest = all_days[-4]
     for rank, code in enumerate(top40_by_day.get(day_m1_latest, []), 1):
         info = extract_stock_traits(code, rank, day_m1_latest, day_m2_latest, d_m3_latest, chart_cache, inv_cache, popular_now)
         info["Name"] = universe.get(code, code)
@@ -490,9 +530,8 @@ def main():
             t_fl = f"+{r['Today_Fluc']}%" if r["Today_Fluc"] > 0 else f"{r['Today_Fluc']}%"
             lines.append(f"| {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{t_fl}** | **{r['Sig_Count']}개** | {r['Traits']} |")
 
-    # (C) 3차 종가베팅 후보 (그저께 D-2 발생 주도주 -> 오늘 D+2 종가 재진입)
     rows_bet3 = []
-    d_m4_latest = trading_days[-5]
+    d_m4_latest = all_days[-5]
     for rank, code in enumerate(top40_by_day.get(day_m2_latest, []), 1):
         info = extract_stock_traits(code, rank, day_m2_latest, d_m3_latest, d_m4_latest, chart_cache, inv_cache, popular_now)
         info["Name"] = universe.get(code, code)
@@ -509,7 +548,7 @@ def main():
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print("1·2·3차 릴레이 종가베팅 DB 및 리포트 생성이 완벽히 완료되었습니다!")
+    print("4월~10월 전 구간 국면별 DB 및 리포트 생성이 완벽히 완료되었습니다!")
 
 if __name__ == "__main__":
     main()
