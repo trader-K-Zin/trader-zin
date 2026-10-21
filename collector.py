@@ -234,8 +234,9 @@ def main():
         try:
             db_df = pd.read_csv(DB_FILE, dtype={"Ticker": str, "Base_Date": str})
             has_april = any(str(d).startswith("202604") for d in db_df["Base_Date"].dropna().unique())
-            if "Bet3_Win_3Pct" not in db_df.columns or not has_april:
-                print("전체 기간 통합 DB 구축을 위해 역추적을 시작합니다.")
+            # [핵심 수정] 거래대금 상위 40위 선필터링 로직(Logic_V2)이 적용되지 않은 구버전 DB면 전체 재구축
+            if "Bet3_Win_3Pct" not in db_df.columns or "Logic_V2" not in db_df.columns or not has_april:
+                print("거래대금 상위 40위 선(先)필터링 기준 적용을 위해 전체 기간 통합 DB 역추적을 다시 시작합니다.")
                 db_df = pd.DataFrame()
                 existing_dates = set()
             else:
@@ -267,7 +268,7 @@ def main():
 
     days_to_scan = sorted(list(set(eval_days + [day_0_latest, day_m1_latest, day_m2_latest])))
     for d_str in days_to_scan:
-        bullish_pool = []
+        daily_stocks = []
         all_vol_pool = []
         for code, df_c in chart_cache.items():
             sub = df_c[df_c["Date"] == d_str]
@@ -276,20 +277,30 @@ def main():
                 val = float(r["Val_Approx"])
                 fluc = float(r["Fluc"])
                 is_bull = bool(r["Is_Bullish"])
+                # 1) 모든 종목의 순수 거래대금(val)과 양봉 여부를 함께 저장
+                daily_stocks.append((code, val, is_bull, fluc))
                 all_vol_pool.append((code, val * abs(fluc)))
-                if is_bull and fluc >= 1.0:
-                    bullish_pool.append((code, val))
 
-        bullish_pool.sort(key=lambda x: x[1], reverse=True)
+        # [핵심 수정 1단계] 양봉 여부와 무관하게 무조건 당일 '순수 거래대금(val)' 기준 내림차순 정렬 후 상위 40위 절단
+        daily_stocks.sort(key=lambda x: x[1], reverse=True)
+        top40_vol_stocks = daily_stocks[:40]
+
+        # [핵심 수정 2단계] 거래대금 상위 40위 안에 든 종목 중 '+1% 이상 양봉(is_bull)'만 최종 픽스
+        # 실제 거래대금 순위(1~40위)를 그대로 보존하기 위해 (실제대금순위, 종목코드) 형태로 저장
+        selected_bullish_in_top40 = [
+            (vol_rank, code)
+            for vol_rank, (code, val, is_bull, fluc) in enumerate(top40_vol_stocks, 1)
+            if is_bull and fluc >= 1.0
+        ]
+
         all_vol_pool.sort(key=lambda x: x[1], reverse=True)
 
-        selected_40 = [x[0] for x in bullish_pool[:40]]
-        top40_by_day[d_str] = selected_40
+        top40_by_day[d_str] = selected_bullish_in_top40
         top_vol_top10_by_day[d_str] = set([x[0] for x in all_vol_pool[:10]])
-        tracked_tickers.update(selected_40)
+        tracked_tickers.update([code for _, code in selected_bullish_in_top40])
 
     pages_to_fetch = 8 if len(eval_days) > 10 else 2
-    print(f"Step 3: 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
+    print(f"Step 3: 대금 상위 40위 내 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
     inv_cache = {}
     for code in tracked_tickers:
         inv_cache[code] = get_investor_data(code, max_pages=pages_to_fetch)
@@ -311,7 +322,8 @@ def main():
             d_plus3 = all_days[idx + 3]
             pop_proxies = top_vol_top10_by_day.get(d0_date, set())
 
-            for rank, code in enumerate(top40_by_day.get(d0_date, []), 1):
+            # [핵심 수정] vol_rank는 당일 전체 시장 거래대금 1~40위 내의 실제 순위
+            for vol_rank, code in top40_by_day.get(d0_date, []):
                 name = universe.get(code, code)
                 df_c = chart_cache[code]
                 df_until = df_c[df_c["Date"] <= d0_date]
@@ -351,7 +363,7 @@ def main():
                     "D1_Date": d_plus1,
                     "D2_Date": d_plus2,
                     "D3_Date": d_plus3,
-                    "Rank": rank,
+                    "Rank": vol_rank,  # 거래대금 상위 40위 내 실제 순위 기록
                     "Ticker": code,
                     "Name": name,
                     "D0_Close": int(c0),
@@ -367,6 +379,7 @@ def main():
                     "Bet2_Win_3Pct": bet2_win,
                     "Bet3_Max_Ret": bet3_ret,
                     "Bet3_Win_3Pct": bet3_win,
+                    "Logic_V2": 1,  # 거래대금 40위 선필터링 적용 마커
                 }
                 rec.update(sig_dict)
                 new_records.append(rec)
@@ -379,7 +392,6 @@ def main():
         print("DB에 데이터가 없습니다.")
         return
 
-    # 기존 DB 레코드 포함 전체에 대해 YearMonth, Sig_Count, 일별 추천 순위(Pick_Rank), TOP 5 여부(Is_Top5) 일괄 정규화
     if "Regime" in db_df.columns:
         db_df.drop(columns=["Regime"], inplace=True)
 
@@ -389,7 +401,7 @@ def main():
     db_df["Sig_Count"] = db_df[signal_cols].sum(axis=1)
 
     db_df.drop_duplicates(subset=["Base_Date", "Ticker"], keep="last", inplace=True)
-    # 일자별 시그널 최다 보유 + 등락률 상위 순으로 정렬하여 1~5위에 Is_Top5 = 1 부여
+    # 일자별 시그널 최다 보유 + 등락률 상위 + 실제 거래대금 순위(Rank) 순으로 정렬하여 1~5위에 Is_Top5 = 1 부여
     db_df.sort_values(by=["Base_Date", "Sig_Count", "D0_Fluc", "Rank"], ascending=[True, False, False, True], inplace=True)
     db_df["Pick_Rank"] = db_df.groupby("Base_Date").cumcount() + 1
     db_df["Is_Top5"] = (db_df["Pick_Rank"] <= 5).astype(int)
@@ -427,11 +439,11 @@ def main():
         "# 🎯 트레이더 진 주도주 릴레이 종가베팅(1·2·3차) 영구 누적 & TOP 5 승률 리포트",
         f"- **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST)",
         f"- **누적 검증 기간:** `{min_dt}` ~ `{max_dt}` (총 **{total_days}거래일** / 전체 표본 **{total_cnt:,}개** / TOP 5 표본 **{top5_cnt:,}개**)",
-        f"- **선정 기준:** 전체 모수(`D0` 대금 상위 +1% 양봉 40개) vs **깃허브 픽 TOP 5**(일별 시그널 최다 중첩 상위 5종목)\n",
-        "## 🏆 0-1. [전체 모수(Top 40) vs 깃허브 추천 픽(TOP 5)] 실전 승률 비교",
+        f"- **선정 기준:** 당일 **거래대금 상위 40위 선(先)확정** 후 ➔ 그중 **+1% 이상 양봉 마감 종목**만 엄선 vs **깃허브 픽 TOP 5**\n",
+        "## 🏆 0-1. [전체 모수(대금 40위 내 양봉) vs 깃허브 추천 픽(TOP 5)] 실전 승률 비교",
         "| 구분 | 1차 종베(D0➔D1) 승률 | 1차 평균최고 | **2차 종베(D1➔D2) 승률** | 2차 평균최고 | 3차 종베(D2➔D3) 승률 | 3차 평균최고 |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        f"| **전체 양봉 주도주 (일 40개)** | {b1_w}% | +{b1_r}% | **{b2_w}%** | +{b2_r}% | {b3_w}% | +{b3_r}% |",
+        f"| **대금 40위 내 양봉 주도주** | {b1_w}% | +{b1_r}% | **{b2_w}%** | +{b2_r}% | {b3_w}% | +{b3_r}% |",
         f"| ⭐ **깃허브 추천 TOP 5 (일 5개)** | **{t1_w}%** | **+{t1_r}%** | 🔥 **{t2_w}%** | **+{t2_r}%** | **{t3_w}%** | **+{t3_r}%** |\n",
         "## 📈 0-2. 최근 시황 흐름별(Rolling Window) 동적 승률 추이 (장세 자동 감지)",
         "| 조회 구간 (시황 온도계) | 거래일수 | 전체 1차 종베 | 전체 2차 종베 | ⭐ **TOP 5 1차 종베** | 🔥 **TOP 5 2차 종베** | ⭐ **TOP 5 3차 종베** |",
@@ -488,12 +500,11 @@ def main():
             f"**{w3}%** | +{r3}% |"
         )
 
-    # 최근 검증 완료된 TOP 5 픽의 실제 적중 내역 (최근 3거래일 = 15종목)
     lines.extend([
         "\n---",
         "## 🏅 2. 최근 깃허브 추천 TOP 5 종목의 실제 채점 결과 (최근 3거래일 검증 완료분)",
-        "| 기준일(D0) | 추천순위 | 종목명 (티커) | 보유옵션 | 1차 종베(D0➔D1) | **2차 종베(D1➔D2)** | 3차 종베(D2➔D3) |",
-        "| :---: | :---: | :--- | :---: | :---: | :---: | :---: |"
+        "| 기준일(D0) | 추천순위 | 종목명 (티커) | 대금순위 | 보유옵션 | 1차 종베(D0➔D1) | **2차 종베(D1➔D2)** | 3차 종베(D2➔D3) |",
+        "| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |"
     ])
     recent_3days = unique_dates[-3:]
     recent_t5 = top5_df[top5_df["Base_Date"].isin(recent_3days)].sort_values(by=["Base_Date", "Pick_Rank"], ascending=[False, True])
@@ -501,19 +512,18 @@ def main():
         m1 = f"⭕ +{r['Bet1_Max_Ret']}%" if r["Bet1_Win_3Pct"] == 1 else f"❌ {r['Bet1_Max_Ret']}%"
         m2 = f"⭕ **+{r['Bet2_Max_Ret']}%**" if r["Bet2_Win_3Pct"] == 1 else f"❌ {r['Bet2_Max_Ret']}%"
         m3 = f"⭕ +{r['Bet3_Max_Ret']}%" if r["Bet3_Win_3Pct"] == 1 else f"❌ {r['Bet3_Max_Ret']}%"
-        lines.append(f"| {r['Base_Date']} | **TOP {r['Pick_Rank']}** | **{r['Name']}** ({r['Ticker']}) | {r['Sig_Count']}개 | {m1} | {m2} | {m3} |")
+        lines.append(f"| {r['Base_Date']} | **TOP {r['Pick_Rank']}** | **{r['Name']}** ({r['Ticker']}) | {r['Rank']}위 | {r['Sig_Count']}개 | {m1} | {m2} | {m3} |")
 
-    # 금일 실전 종가베팅 타점 리스트 (TOP 5 집중 추천)
     lines.append(f"\n---\n## 🚀 3. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 실전 TOP 5 추천 리스트\n")
 
     def build_candidate_table(target_d0, d_m1, d_m2):
         rows = []
         pop_set = popular_now.union(top_vol_top10_by_day.get(target_d0, set())) if target_d0 == day_0_latest else top_vol_top10_by_day.get(target_d0, set())
-        for rank, code in enumerate(top40_by_day.get(target_d0, []), 1):
+        for vol_rank, code in top40_by_day.get(target_d0, []):
             c0, fluc0, _, sig_cnt, traits_str = evaluate_signals(code, target_d0, d_m1, d_m2, chart_cache, inv_cache, pop_set)
             today_row = chart_cache[code].iloc[-1]
             rows.append({
-                "Rank": rank,
+                "Rank": vol_rank,
                 "Ticker": code,
                 "Name": universe.get(code, code),
                 "Base_Fluc": round(fluc0, 2),
@@ -533,7 +543,7 @@ def main():
     df_b1 = build_candidate_table(day_0_latest, day_m1_latest, day_m2_latest)
     if not df_b1.empty:
         lines.append(f"### 🎯 [1차 종가베팅 TOP 5] 당일({day_0_latest}) 신규 주도주 (오늘 종가 매수 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | 대금순위 | 종목명 (티커) | 당일 등락률 | 보유 옵션 수 | 포착된 핵심 옵션 상세 |")
+        lines.append("| 픽 순위 | 실제대금순위 | 종목명 (티커) | 당일 등락률 | 보유 옵션 수 | 포착된 핵심 옵션 상세 |")
         lines.append("| :---: | :---: | :--- | :---: | :---: | :--- |")
         for _, r in df_b1.head(5).iterrows():
             lines.append(f"| ⭐ **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{r['Sig_Count']}개** | {r['Traits']} |")
@@ -541,7 +551,7 @@ def main():
     df_b2 = build_candidate_table(day_m1_latest, day_m2_latest, d_m3_latest)
     if not df_b2.empty:
         lines.append(f"\n### 🔄 [2차 종가베팅 TOP 5] 전일({day_m1_latest}) 주도주의 D+1일 차 (오늘 종가 재진입 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | 전일순위 | 종목명 (티커) | 전일(D0) 등락 | **금일(D+1) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
+        lines.append("| 픽 순위 | 전일대금순위 | 종목명 (티커) | 전일(D0) 등락 | **금일(D+1) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
         lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :--- |")
         for _, r in df_b2.head(5).iterrows():
             t_fl = f"+{r['Today_Fluc']}%" if r["Today_Fluc"] > 0 else f"{r['Today_Fluc']}%"
@@ -550,7 +560,7 @@ def main():
     df_b3 = build_candidate_table(day_m2_latest, d_m3_latest, d_m4_latest)
     if not df_b3.empty:
         lines.append(f"\n### ⚡ [3차 종가베팅 TOP 5] 2일 전({day_m2_latest}) 주도주의 D+2일 차 (오늘 종가 재진입 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | D0순위 | 종목명 (티커) | 2일전(D0) 등락 | **금일(D+2) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
+        lines.append("| 픽 순위 | D0대금순위 | 종목명 (티커) | 2일전(D0) 등락 | **금일(D+2) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
         lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :--- |")
         for _, r in df_b3.head(5).iterrows():
             t_fl = f"+{r['Today_Fluc']}%" if r["Today_Fluc"] > 0 else f"{r['Today_Fluc']}%"
