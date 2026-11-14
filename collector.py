@@ -10,7 +10,7 @@ now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 DB_FILE = "history_db.csv"
 INV_DB_FILE = "inverse_db.csv"
 REPORT_FILE = "WIN_RATE_REPORT.md"
-TOP_N_VOL = 30  # 거래대금 상위 40위 -> 30위로 기준 상향 압축
+TOP_N_VOL = 30  # 거래대금 상위 40위 -> 30위로 기준 압축
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -78,6 +78,91 @@ def get_major_universe():
             except Exception:
                 pass
     return tickers
+
+def get_ticker_sector_map(universe_codes):
+    """
+    [신설 - 오류 제로 안전 설계] 네이버 증권 업종 분류를 통해 종목별 소속 섹터(업종명) 매핑
+    - 웹 구조 변경이나 타임아웃이 발생해도 절대 멈추지 않고 안전하게 기본값('일반업종')으로 폴백 처리
+    """
+    sector_map = {}
+    try:
+        url = "https://finance.naver.com/sise/sise_group.naver?type=upjong"
+        res = requests.get(url, headers=HEADERS, timeout=8)
+        html = res.content.decode("euc-kr", "replace")
+        soup = BeautifulSoup(html, "html.parser")
+
+        upjong_list = []
+        for a_tag in soup.select("td a[href*='sise_group_detail.naver']"):
+            sec_name = a_tag.text.strip()
+            href = a_tag.get("href", "")
+            if "no=" in href and sec_name:
+                up_no = href.split("no=")[-1].split("&")[0].strip()
+                upjong_list.append((sec_name, up_no))
+
+        # 중복 제거 후 주요 업종 순회하며 티커별 업종명 매핑
+        seen_no = set()
+        for sec_name, up_no in upjong_list:
+            if up_no in seen_no:
+                continue
+            seen_no.add(up_no)
+            d_url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=upjong&no={up_no}"
+            try:
+                r_det = requests.get(d_url, headers=HEADERS, timeout=5)
+                h_det = r_det.content.decode("euc-kr", "replace")
+                s_det = BeautifulSoup(h_det, "html.parser")
+                for a in s_det.select("div.name_area a[href*='code=']"):
+                    code = a.get("href", "").split("code=")[-1].strip()[:6]
+                    if len(code) == 6 and code in universe_codes and code not in sector_map:
+                        sector_map[code] = sec_name
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return sector_map
+
+def build_daily_sector_stats(days_to_scan, chart_cache, sector_map, top30_by_day):
+    """
+    [핵심] 과거 모든 거래일(D0)별로 어떤 섹터가 강세였는지 일봉 캐시로 초고속 역산
+    - 조건 A: 해당 일자(D0)에 섹터 내 유니버스 평균 등락률이 +1.5% 이상이면서 당일 상위 TOP 5 섹터인 경우
+    - 조건 B: 해당 일자(D0) 거래대금 상위 30위 양봉 주도주 안에 동일 섹터 종목이 2개 이상 동반 진입한 경우 (주도 섹터 집중)
+    """
+    hot_sectors_by_day = {}
+    sector_fluc_by_day = {}
+    sector_lead_cnt_by_day = {}
+
+    for d_str in days_to_scan:
+        sec_flucs = {}
+        for code, df_c in chart_cache.items():
+            sec = sector_map.get(code, "")
+            if not sec or sec == "기타":
+                continue
+            sub = df_c[df_c["Date"] == d_str]
+            if not sub.empty:
+                fluc = float(sub.iloc[0]["Fluc"])
+                sec_flucs.setdefault(sec, []).append(fluc)
+
+        avg_sec_map = {sec: round(sum(vals) / len(vals), 2) for sec, vals in sec_flucs.items() if len(vals) >= 2}
+        sector_fluc_by_day[d_str] = avg_sec_map
+
+        # 당일 평균 등락률 상위 5개 강세 섹터 추출 (+1.5% 이상)
+        sorted_secs = sorted(avg_sec_map.items(), key=lambda x: x[1], reverse=True)
+        top_fluc_secs = set([sec for sec, avg_f in sorted_secs[:5] if avg_f >= 1.5])
+
+        # 당일 거래대금 상위 30위 내 양봉 종목 중 동일 섹터 2종목 이상 포착된 주도 섹터 추출
+        lead_counts = {}
+        for _, code in top30_by_day.get(d_str, []):
+            sec = sector_map.get(code, "")
+            if sec and sec != "기타":
+                lead_counts[sec] = lead_counts.get(sec, 0) + 1
+        sector_lead_cnt_by_day[d_str] = lead_counts
+
+        multi_lead_secs = set([sec for sec, cnt in lead_counts.items() if cnt >= 2 and avg_sec_map.get(sec, 0.0) >= 0.5])
+
+        # 두 기준 중 하나라도 만족하면 당일 강세(주도) 섹터로 인정
+        hot_sectors_by_day[d_str] = top_fluc_secs.union(multi_lead_secs)
+
+    return hot_sectors_by_day, sector_fluc_by_day, sector_lead_cnt_by_day
 
 def get_naver_chart_df(ticker, count=260):
     """일봉 로드 (개별주 및 KOSPI 지수 공통 지원, 1년=260거래일 대응)"""
@@ -177,8 +262,8 @@ def get_kospi_market_investor(max_pages=28):
             pass
     return mkt_map
 
-def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_set):
-    """특정 기준일(D0)의 12대 시그널 및 태그 산출"""
+def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_set, sector_map, hot_sectors_by_day):
+    """특정 기준일(D0)의 13대 시그널(S1~S12 + S13_당일강세섹터) 및 태그 산출"""
     df_c = chart_cache[code]
     df_until = df_c[df_c["Date"] <= target_day]
     cur = df_until.iloc[-1]
@@ -198,6 +283,9 @@ def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_s
     inst_m1, for_m1 = inv_data.get(d_m1, (0.0, 0.0))
     inst_m2, for_m2 = inv_data.get(d_m2, (0.0, 0.0))
 
+    sec_name = sector_map.get(code, "기타")
+    hot_secs_today = hot_sectors_by_day.get(target_day, set())
+
     s1_pop = 1 if (code in pop_set) else 0
     s2_for = 1 if for_0 > 0 else 0
     s3_for3 = 1 if (for_0 > 0 and for_m1 > 0 and for_m2 > 0) else 0
@@ -210,6 +298,7 @@ def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_s
     s10_candle = 1 if (fluc0 >= 3.0 and h0 > 0 and c0 >= h0 * 0.98) else 0
     s11_trend = 1 if (ma5 > ma20 > ma60) else 0
     s12_scombo = 1 if (s8_twin == 1 and (s6_high == 1 or s10_candle == 1)) else 0
+    s13_hot_sec = 1 if (sec_name != "기타" and sec_name in hot_secs_today) else 0
 
     sig_dict = {
         "S1_인기검색TOP10": s1_pop,
@@ -223,11 +312,14 @@ def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_s
         "S9_메이저수급집중": s9_major,
         "S10_꽉찬양봉마감": s10_candle,
         "S11_이평선정배열": s11_trend,
-        "S12_S급복합시그널": s12_scombo
+        "S12_S급복합시그널": s12_scombo,
+        "S13_당일강세섹터": s13_hot_sec
     }
     sig_count = sum(sig_dict.values())
 
     traits = []
+    if s13_hot_sec:
+        traits.append(f"🚀강세섹터({sec_name})")
     if s1_pop:
         traits.append("🔥인기TOP10")
     if s8_twin:
@@ -531,9 +623,14 @@ def main():
         try:
             db_df = pd.read_csv(DB_FILE, dtype={"Ticker": str, "Base_Date": str})
             has_april = any(str(d).startswith("202604") for d in db_df["Base_Date"].dropna().unique())
-            # [핵심] 거래대금 상위 30위 선필터링(Logic_V3) 기준이 아니면 DB 초기화 후 30위 기준으로 깨끗하게 재구축
-            if "Bet3_Win_3Pct" not in db_df.columns or "Logic_V3" not in db_df.columns or not has_april:
-                print(f"거래대금 상위 {TOP_N_VOL}위 선(先)필터링(Logic_V3) 적용을 위해 전체 기간 통합 DB 역추적을 다시 시작합니다.")
+            # [핵심] 대금 상위 30위 + S13_당일강세섹터 정식 탑재 버전(Logic_V4)이 아니면 깔끔하게 초기화 후 재구축
+            if (
+                "Bet3_Win_3Pct" not in db_df.columns
+                or "Logic_V4" not in db_df.columns
+                or "S13_당일강세섹터" not in db_df.columns
+                or not has_april
+            ):
+                print(f"거래대금 상위 {TOP_N_VOL}위 + S13_당일강세섹터(Logic_V4) 적용을 위해 전체 기간 통합 DB 역추적을 다시 시작합니다.")
                 db_df = pd.DataFrame()
                 existing_dates = set()
             else:
@@ -545,12 +642,14 @@ def main():
         db_df = pd.DataFrame()
         existing_dates = set()
 
-    print("Step 2: 개별 종목 210일 일봉 차트 캐싱 중...")
+    print("Step 2: 개별 종목 210일 일봉 차트 캐싱 및 업종(섹터) 매핑 중...")
     chart_cache = {}
     for code in universe.keys():
         df_c = get_naver_chart_df(code, count=210)
         if not df_c.empty and len(df_c) >= 60:
             chart_cache[code] = df_c
+
+    sector_map = get_ticker_sector_map(set(chart_cache.keys()))
 
     possible_eval_days = [d for d in all_days[:-3] if d >= "20260401"]
     eval_days = [d for d in possible_eval_days if d not in existing_dates]
@@ -582,7 +681,6 @@ def main():
                 all_vol_pool.append((code, val * abs(fluc)))
 
         daily_stocks.sort(key=lambda x: x[1], reverse=True)
-        # [핵심 수정] 거래대금 상위 40위 -> 30위(TOP_N_VOL)로 엄격 압축
         top_vol_stocks = daily_stocks[:TOP_N_VOL]
 
         selected_bullish_in_top30 = [
@@ -596,6 +694,11 @@ def main():
         top30_by_day[d_str] = selected_bullish_in_top30
         top_vol_top10_by_day[d_str] = set([x[0] for x in all_vol_pool[:10]])
         tracked_tickers.update([code for _, code in selected_bullish_in_top30])
+
+    # 일자별 강세 섹터(S13) 및 섹터별 평균 등락률 역산
+    hot_sectors_by_day, sector_fluc_by_day, sector_lead_cnt_by_day = build_daily_sector_stats(
+        days_to_scan, chart_cache, sector_map, top30_by_day
+    )
 
     pages_to_fetch = 8 if len(eval_days) > 10 else 3
     print(f"Step 3: 대금 상위 {TOP_N_VOL}위 내 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
@@ -628,7 +731,7 @@ def main():
                     continue
 
                 c0, fluc0, sig_dict, sig_count, _ = evaluate_signals(
-                    code, d0_date, d_minus1, d_minus2, chart_cache, inv_cache, pop_proxies
+                    code, d0_date, d_minus1, d_minus2, chart_cache, inv_cache, pop_proxies, sector_map, hot_sectors_by_day
                 )
                 if c0 <= 0:
                     continue
@@ -663,6 +766,7 @@ def main():
                     "Rank": vol_rank,
                     "Ticker": code,
                     "Name": name,
+                    "Sector": sector_map.get(code, "기타"),
                     "D0_Close": int(c0),
                     "D0_Fluc": round(fluc0, 2),
                     "D1_Close": int(c_p1),
@@ -676,7 +780,7 @@ def main():
                     "Bet2_Win_3Pct": bet2_win,
                     "Bet3_Max_Ret": bet3_ret,
                     "Bet3_Win_3Pct": bet3_win,
-                    "Logic_V3": 1,
+                    "Logic_V4": 1,
                 }
                 rec.update(sig_dict)
                 new_records.append(rec)
@@ -689,14 +793,18 @@ def main():
         print("DB에 데이터가 없습니다.")
         return
 
-    for drop_col in ["Regime", "Logic_V2"]:
+    for drop_col in ["Regime", "Logic_V2", "Logic_V3"]:
         if drop_col in db_df.columns:
             db_df.drop(columns=[drop_col], inplace=True)
 
-    # 혹시라도 남아있는 30위 밖 데이터 필터링 보장
     db_df = db_df[db_df["Rank"] <= TOP_N_VOL].copy()
+    if "Sector" not in db_df.columns:
+        db_df["Sector"] = db_df["Ticker"].map(lambda x: sector_map.get(str(x), "기타"))
 
-    signal_cols = [c for c in db_df.columns if c.startswith("S") and "_" in c]
+    signal_cols = sorted(
+        [c for c in db_df.columns if c.startswith("S") and "_" in c],
+        key=lambda x: int(x.split("_")[0][1:]) if x.split("_")[0][1:].isdigit() else 99
+    )
     db_df["Base_Date"] = db_df["Base_Date"].astype(str)
     db_df["YearMonth"] = db_df["Base_Date"].str.slice(0, 4) + "-" + db_df["Base_Date"].str.slice(4, 6)
     db_df["Sig_Count"] = db_df[signal_cols].sum(axis=1)
@@ -708,7 +816,7 @@ def main():
 
     db_df.sort_values(by=["Base_Date", "Rank"], ascending=[True, True], inplace=True)
     db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
-    print(f"영구 DB(총 {len(db_df)}건, 대금 상위 {TOP_N_VOL}위 기준) 및 TOP 5 태깅 업데이트 완료!")
+    print(f"영구 DB(총 {len(db_df)}건, 대금 상위 {TOP_N_VOL}위 & 13대 시그널 기준) 업데이트 완료!")
 
     total_cnt = len(db_df)
     unique_dates = sorted(db_df["Base_Date"].unique())
@@ -734,7 +842,6 @@ def main():
     b1_w, b1_r, b2_w, b2_r, b3_w, b3_r = calc_metrics(db_df)
     t1_w, t1_r, t2_w, t2_r, t3_w, t3_r = calc_metrics(top5_df)
 
-    # 최근 3개월(최대 60거래일) 및 최근 1개월(최대 20거래일) 구간 정의
     dates_3m = unique_dates[-60:]
     dates_1m = unique_dates[-20:]
     days_3m_cnt = len(dates_3m)
@@ -746,7 +853,7 @@ def main():
         "# 🎯 트레이더 진 주도주 릴레이 종가베팅(1·2·3차) & 코스피 인버스 영구 누적 리포트",
         f"- **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST)",
         f"- **누적 검증 기간:** `{min_dt}` ~ `{max_dt}` (총 **{total_days}거래일** / 전체 표본 **{total_cnt:,}개** / TOP 5 표본 **{top5_cnt:,}개**)",
-        f"- **선정 기준:** 당일 **거래대금 상위 {TOP_N_VOL}위 선(先)확정** 후 ➔ 그중 **+1% 이상 양봉 마감 종목**만 엄선 vs **깃허브 픽 TOP 5**\n",
+        f"- **선정 기준:** 당일 **거래대금 상위 {TOP_N_VOL}위 선(先)확정** 후 ➔ 그중 **+1% 이상 양봉 마감 종목**만 엄선 vs **깃허브 픽 TOP 5 (13대 시그널)**\n",
         f"## 🏆 0-1. [전체 모수(대금 {TOP_N_VOL}위 내 양봉) vs 깃허브 추천 픽(TOP 5)] 실전 승률 비교",
         "| 구분 | 1차 종베(D0➔D1) 승률 | 1차 평균최고 | **2차 종베(D1➔D2) 승률** | 2차 평균최고 | 3차 종베(D2➔D3) 승률 | 3차 평균최고 |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -783,15 +890,13 @@ def main():
         tw1, _, tw2, _, tw3, _ = calc_metrics(sub_ym_t5)
         lines.append(f"| **{ym}** | {len(sub_ym)}건 / {len(sub_ym_t5)}건 | {aw1}% | {aw2}% | **{tw1}%** | **{tw2}%** | **{tw3}%** |")
 
-    # =========================================================================
-    # [신설 핵심 섹션] TOP 5 종목들의 12대 시그널 항목별 [누적 vs 최근 3개월 vs 최근 1개월] 승률 및 시황 분석
-    # =========================================================================
+    # TOP 5 전용 13대 시그널 항목별 (전체 누적 vs 3개월 vs 1개월) 승률 및 시황 분석
     top5_3m = top5_df[top5_df["Base_Date"].isin(dates_3m)]
     top5_1m = top5_df[top5_df["Base_Date"].isin(dates_1m)]
 
     lines.extend([
         "\n---",
-        f"## 🔍 1-1. [깃허브 추천 TOP 5 전용] 12대 시그널 항목별 (전체 누적 vs {note_3m} vs {note_1m}) 승률 비교",
+        f"## 🔍 1-1. [깃허브 추천 TOP 5 전용] 13대 시그널 항목별 (전체 누적 vs {note_3m} vs {note_1m}) 승률 비교",
         "| 순위 | TOP 5 내 시그널 항목 | 누적/3M/1M 표본 | **1차 종베 (누적 / 3개월 / 1개월)** | 🔥 **2차 종베 (누적 / 3개월 / 1개월)** | **1개월 트렌드(1차/2차)** |",
         "| :---: | :--- | :---: | :---: | :---: | :---: |"
     ])
@@ -816,11 +921,9 @@ def main():
             "c_all": c_all, "c_3m": c_3m, "c_1m": c_1m,
             "w1_all": w1_all, "w1_3m": w1_3m, "w1_1m": w1_1m,
             "w2_all": w2_all, "w2_3m": w2_3m, "w2_1m": w2_1m,
-            "diff_w1": diff_w1, "diff_w2": diff_w2,
-            "best_recent": max(w1_1m, w2_1m)
+            "diff_w1": diff_w1, "diff_w2": diff_w2
         })
 
-    # 최근 1개월 2차 종베 승률 -> 최근 1개월 1차 종베 승률 -> 누적 2차 종베 승률 순으로 정렬
     t5_sig_trends.sort(key=lambda x: (x["w2_1m"], x["w1_1m"], x["w2_all"]), reverse=True)
 
     for idx, item in enumerate(t5_sig_trends, 1):
@@ -834,7 +937,6 @@ def main():
             f"{trend_badge} ({d1_str} / {d2_str}) |"
         )
 
-    # 시황 흐름 자동 진단 로직
     all_t5_w1, _, all_t5_w2, _, _, _ = calc_metrics(top5_df)
     m3_t5_w1, _, m3_t5_w2, _, _, _ = calc_metrics(top5_3m)
     m1_t5_w1, _, m1_t5_w2, _, _, _ = calc_metrics(top5_1m)
@@ -851,6 +953,15 @@ def main():
     hot_2nd_str = ", ".join([f"**{x['name']}**(1개월 {x['w2_1m']}%, 누적대비 {x['diff_w2']:+.1f}%p)" for x in hot_2nd])
     cool_str = ", ".join([f"**{x['name']}**(1차 {x['w1_1m']}% / 2차 {x['w2_1m']}%)" for x in cool_sigs])
 
+    # 당일 거래대금 30위 내 주도 섹터 요약
+    today_lead_cnts = sector_lead_cnt_by_day.get(day_0_latest, {})
+    today_sec_flucs = sector_fluc_by_day.get(day_0_latest, {})
+    top_today_secs = sorted(today_lead_cnts.items(), key=lambda x: (x[1], today_sec_flucs.get(x[0], 0.0)), reverse=True)[:4]
+    lead_sec_str = ", ".join([
+        f"**{sec}**({cnt}종목, 평균 {today_sec_flucs.get(sec, 0.0):+.1f}%)"
+        for sec, cnt in top_today_secs
+    ]) if top_today_secs else "개별 종목 장세"
+
     if m1_t5_w2 > m1_t5_w1 + 3.0:
         regime_msg = (
             f"최근 1개월은 당일 바로 쏘는 1차 종베(**{m1_t5_w1}%**)보다 하루 쉬어간 뒤 재돌파하는 **2차 종베({m1_t5_w2}%)의 승률이 +{round(m1_t5_w2 - m1_t5_w1, 1)}%p 더 높은 '눌림목·N자형 순환매 장세'**입니다. "
@@ -859,7 +970,7 @@ def main():
     elif m1_t5_w1 > m1_t5_w2 + 3.0:
         regime_msg = (
             f"최근 1개월은 **1차 종베 승률({m1_t5_w1}%)**이 2차 종베(**{m1_t5_w2}%**)를 앞서는 **'강한 당일 모멘텀·돌파 장세'**입니다. "
-            f"대금 상위 30위 내 수급이 집중된 당일 대장주를 지체 없이 1차 종가베팅으로 공략하는 것이 효과적입니다."
+            f"대금 상위 30위 내 수급과 강세 섹터가 집중된 당일 대장주를 1차 종가베팅으로 공략하는 것이 효과적입니다."
         )
     else:
         regime_msg = (
@@ -870,6 +981,7 @@ def main():
     lines.extend([
         "\n### 🧭 1-2. [시황 나침반] TOP 5 데이터로 본 요즘 시장 흐름 자동 판독 브리핑",
         f"- **TOP 5 전체 승률 추이:** 전체 누적(1차 **{all_t5_w1}%** / 2차 **{all_t5_w2}%**) ➔ {note_3m}(1차 **{m3_t5_w1}%** / 2차 **{m3_t5_w2}%**) ➔ **{note_1m}(1차 {m1_t5_w1}% / 2차 {m1_t5_w2}%)**",
+        f"- **금일({day_0_latest}) 대금 30위 내 양봉 집중 강세 섹터:** {lead_sec_str}",
         f"- **현재 장세 성격 진단:** {regime_msg}",
         f"- 🔥 **최근 1개월 [1차 종베] 최고 승률 조건:** {hot_1st_str}",
         f"- 🔥 **최근 1개월 [2차 종베] 최고 승률 조건:** {hot_2nd_str}",
@@ -878,7 +990,7 @@ def main():
 
     lines.extend([
         "\n---",
-        f"## 📊 1-3. [전체 모수(대금 {TOP_N_VOL}위 내 양봉)] 12대 시그널 옵션별 1·2·3차 누적 승률 랭킹",
+        f"## 📊 1-3. [전체 모수(대금 {TOP_N_VOL}위 내 양봉)] 13대 시그널 옵션별 1·2·3차 누적 승률 랭킹",
         "| 순위 | D0 발생 옵션 (시그널) | 누적 표본 | **1차 종베 승률(D0➔D1)** | 1차 최고 | **2차 종베 승률(D1➔D2)** | 2차 최고 | **3차 종베 승률(D2➔D3)** | 3차 최고 |",
         "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ])
@@ -903,8 +1015,8 @@ def main():
     lines.extend([
         "\n---",
         "## 🏅 2. 최근 깃허브 추천 TOP 5 종목의 실제 채점 결과 (최근 3거래일 검증 완료분)",
-        "| 기준일(D0) | 추천순위 | 종목명 (티커) | 대금순위 | 보유옵션 | 1차 종베(D0➔D1) | **2차 종베(D1➔D2)** | 3차 종베(D2➔D3) |",
-        "| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |"
+        "| 기준일(D0) | 추천순위 | 종목명 (티커) | 소속 섹터 | 대금순위 | 보유옵션 | 1차 종베(D0➔D1) | **2차 종베(D1➔D2)** | 3차 종베(D2➔D3) |",
+        "| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |"
     ])
     recent_3days = unique_dates[-3:]
     recent_t5 = top5_df[top5_df["Base_Date"].isin(recent_3days)].sort_values(by=["Base_Date", "Pick_Rank"], ascending=[False, True])
@@ -912,9 +1024,13 @@ def main():
         m1 = f"⭕ +{r['Bet1_Max_Ret']}%" if r["Bet1_Win_3Pct"] == 1 else f"❌ {r['Bet1_Max_Ret']}%"
         m2 = f"⭕ **+{r['Bet2_Max_Ret']}%**" if r["Bet2_Win_3Pct"] == 1 else f"❌ {r['Bet2_Max_Ret']}%"
         m3 = f"⭕ +{r['Bet3_Max_Ret']}%" if r["Bet3_Win_3Pct"] == 1 else f"❌ {r['Bet3_Max_Ret']}%"
-        lines.append(f"| {r['Base_Date']} | **TOP {r['Pick_Rank']}** | **{r['Name']}** ({r['Ticker']}) | {r['Rank']}위 | {r['Sig_Count']}개 | {m1} | {m2} | {m3} |")
+        sec_txt = r.get("Sector", sector_map.get(str(r["Ticker"]), "기타"))
+        lines.append(
+            f"| {r['Base_Date']} | **TOP {r['Pick_Rank']}** | **{r['Name']}** ({r['Ticker']}) | "
+            f"{sec_txt} | {r['Rank']}위 | {r['Sig_Count']}개 | {m1} | {m2} | {m3} |"
+        )
 
-    lines.append(f"\n---\n## 🚀 3. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 실전 TOP 5 추천 리스트 (대금 {TOP_N_VOL}위 기준)\n")
+    lines.append(f"\n---\n## 🚀 3. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 실전 TOP 5 추천 리스트 (대금 {TOP_N_VOL}위 & 강세섹터 반영)\n")
 
     def build_candidate_table(target_d0, d_m1, d_m2):
         rows = []
@@ -922,16 +1038,31 @@ def main():
         if target_d0 == day_0_latest:
             pop_set = pop_set.union(popular_now)
 
+        d0_sec_flucs = sector_fluc_by_day.get(target_d0, {})
+        hot_secs_d0 = hot_sectors_by_day.get(target_d0, set())
+
         for vol_rank, code in top30_by_day.get(target_d0, []):
             if code not in chart_cache:
                 continue
-            c0, fluc0, _, sig_cnt, traits_str = evaluate_signals(code, target_d0, d_m1, d_m2, chart_cache, inv_cache, pop_set)
+            c0, fluc0, _, sig_cnt, traits_str = evaluate_signals(
+                code, target_d0, d_m1, d_m2, chart_cache, inv_cache, pop_set, sector_map, hot_sectors_by_day
+            )
             today_sub = chart_cache[code][chart_cache[code]["Date"] == day_0_latest]
             today_fluc = float(today_sub.iloc[0]["Fluc"]) if not today_sub.empty else float(chart_cache[code].iloc[-1]["Fluc"])
+
+            sec_nm = sector_map.get(code, "기타")
+            sec_avg = d0_sec_flucs.get(sec_nm, 0.0)
+            if sec_nm != "기타":
+                badge = "🔥" if sec_nm in hot_secs_d0 else ""
+                sec_display = f"{badge}{sec_nm}({sec_avg:+.1f}%)"
+            else:
+                sec_display = "기타"
+
             rows.append({
                 "Rank": vol_rank,
                 "Ticker": code,
                 "Name": universe.get(code, code),
+                "Sector_Info": sec_display,
                 "Base_Fluc": round(fluc0, 2),
                 "Today_Fluc": round(today_fluc, 2),
                 "Sig_Count": sig_cnt,
@@ -946,28 +1077,37 @@ def main():
     df_b1 = build_candidate_table(day_0_latest, day_m1_latest, day_m2_latest)
     if not df_b1.empty:
         lines.append(f"### 🎯 [1차 종가베팅 TOP 5] 당일({day_0_latest}) 신규 주도주 (오늘 종가 매수 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | 실제대금순위 | 종목명 (티커) | 당일 등락률 | 보유 옵션 수 | 포착된 핵심 옵션 상세 |")
-        lines.append("| :---: | :---: | :--- | :---: | :---: | :--- |")
+        lines.append("| 픽 순위 | 대금순위 | 종목명 (티커) | 소속 섹터(당일평균) | 당일 등락률 | 보유 옵션 수 | 포착된 핵심 옵션 상세 |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :--- |")
         for _, r in df_b1.head(5).iterrows():
-            lines.append(f"| ⭐ **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{r['Sig_Count']}개** | {r['Traits']} |")
+            lines.append(
+                f"| ⭐ **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | "
+                f"{r['Sector_Info']} | +{r['Base_Fluc']}% | **{r['Sig_Count']}개** | {r['Traits']} |"
+            )
 
     df_b2 = build_candidate_table(day_m1_latest, day_m2_latest, d_m3_latest)
     if not df_b2.empty:
         lines.append(f"\n### 🔄 [2차 종가베팅 TOP 5] 전일({day_m1_latest}) 주도주의 D+1일 차 (오늘 종가 재진입 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | 전일대금순위 | 종목명 (티커) | 전일(D0) 등락 | **금일(D+1) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
-        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :--- |")
+        lines.append("| 픽 순위 | 전일대금순위 | 종목명 (티커) | 소속 섹터(D0평균) | 전일(D0) 등락 | **금일(D+1) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :--- |")
         for _, r in df_b2.head(5).iterrows():
             t_fl = f"+{r['Today_Fluc']}%" if r["Today_Fluc"] > 0 else f"{r['Today_Fluc']}%"
-            lines.append(f"| 🔥 **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{t_fl}** | **{r['Sig_Count']}개** | {r['Traits']} |")
+            lines.append(
+                f"| 🔥 **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | "
+                f"{r['Sector_Info']} | +{r['Base_Fluc']}% | **{t_fl}** | **{r['Sig_Count']}개** | {r['Traits']} |"
+            )
 
     df_b3 = build_candidate_table(day_m2_latest, d_m3_latest, d_m4_latest)
     if not df_b3.empty:
         lines.append(f"\n### ⚡ [3차 종가베팅 TOP 5] 2일 전({day_m2_latest}) 주도주의 D+2일 차 (오늘 종가 재진입 ➔ 내일 10시 전 매도)")
-        lines.append("| 픽 순위 | D0대금순위 | 종목명 (티커) | 2일전(D0) 등락 | **금일(D+2) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
-        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :--- |")
+        lines.append("| 픽 순위 | D0대금순위 | 종목명 (티커) | 소속 섹터(D0평균) | 2일전(D0) 등락 | **금일(D+2) 등락** | D0 옵션 수 | D0 핵심 옵션 |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: | :---: | :--- |")
         for _, r in df_b3.head(5).iterrows():
             t_fl = f"+{r['Today_Fluc']}%" if r["Today_Fluc"] > 0 else f"{r['Today_Fluc']}%"
-            lines.append(f"| ⭐ **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | +{r['Base_Fluc']}% | **{t_fl}** | **{r['Sig_Count']}개** | {r['Traits']} |")
+            lines.append(
+                f"| ⭐ **TOP {r['Pick_Rank']}** | {r['Rank']}위 | **{r['Name']}** ({r['Ticker']}) | "
+                f"{r['Sector_Info']} | +{r['Base_Fluc']}% | **{t_fl}** | **{r['Sig_Count']}개** | {r['Traits']} |"
+            )
 
     inv_report_lines = run_inverse_backtest_and_report()
     if inv_report_lines:
@@ -975,7 +1115,7 @@ def main():
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print("미래 확장형 롤링 윈도우 & TOP 5(대금 30위 기준) + 코스피 인버스 통합 리포트 생성이 완료되었습니다!")
+    print("미래 확장형 롤링 윈도우 & TOP 5(대금 30위 + S13_당일강세섹터) + 코스피 인버스 통합 리포트 생성 완료!")
 
 if __name__ == "__main__":
     main()
