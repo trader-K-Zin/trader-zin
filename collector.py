@@ -10,6 +10,8 @@ now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 DB_FILE = "history_db.csv"
 INV_DB_FILE = "inverse_db.csv"
 REPORT_FILE = "WIN_RATE_REPORT.md"
+TOP_N_VOL = 30  # 거래대금 상위 40위 -> 30위로 기준 상향 압축
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -107,11 +109,7 @@ def get_naver_chart_df(ticker, count=260):
         return pd.DataFrame()
 
 def get_investor_data(ticker, max_pages=8):
-    """
-    [버그 완벽 수정] 외국인/기관 수급 데이터 로드
-    - 모바일 API가 1페이지만 주고 멈추는 현상을 방지하기 위해,
-      필요한 일수(max_pages * 15일)보다 적게 수집되면 즉시 웹 테이블(frgn.naver)에서 전수 보완 수집합니다.
-    """
+    """외국인/기관 수급 데이터 로드 (모바일 API 부족 시 웹 테이블 자동 보완)"""
     inv_map = {}
     for page in range(1, max_pages + 1):
         url = f"https://m.stock.naver.com/api/stock/{ticker}/trend?page={page}&pageSize=20"
@@ -132,7 +130,6 @@ def get_investor_data(ticker, max_pages=8):
         except Exception:
             pass
 
-    # 모바일 API 수집량이 부족할 경우(예: 1년치 요청했는데 20일치만 들어온 경우) 웹 페이지에서 전수 크롤링
     if len(inv_map) < max_pages * 12:
         for page in range(1, max_pages + 1):
             url = f"https://finance.naver.com/item/frgn.naver?code={ticker}&page={page}"
@@ -153,11 +150,7 @@ def get_investor_data(ticker, max_pages=8):
     return inv_map
 
 def get_kospi_market_investor(max_pages=28):
-    """
-    [버그 완벽 수정] 코스피 시장 전체(현물) 외국인/기관 순매수 추이 로드 (최근 1년=250거래일 이상 완벽 커버)
-    - 네이버 투자자별 매매동향 일별 페이지(1페이지당 10거래일 -> 28페이지 = 280거래일) 크롤링
-    - 만약 웹 구조 변경 등으로 누락된 날짜는 KODEX 200(069500) 14페이지(280거래일) 수급으로 빈틈없이 채움
-    """
+    """코스피 시장 전체(현물) 외국인/기관 순매수 추이 로드"""
     mkt_map = {}
     today_str = now.strftime("%Y%m%d")
     for page in range(1, max_pages + 1):
@@ -185,7 +178,7 @@ def get_kospi_market_investor(max_pages=28):
     return mkt_map
 
 def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_set):
-    """특정 기준일(D0)의 12대 시그널 및 태그를 일관되게 산출"""
+    """특정 기준일(D0)의 12대 시그널 및 태그 산출"""
     df_c = chart_cache[code]
     df_until = df_c[df_c["Date"] <= target_day]
     cur = df_until.iloc[-1]
@@ -258,11 +251,8 @@ def evaluate_signals(code, target_day, d_m1, d_m2, chart_cache, inv_cache, pop_s
 
     return c0, fluc0, sig_dict, sig_count, (", ".join(traits) if traits else "양봉 주도주")
 
-
 def evaluate_inverse_signals(d0_date, df_kospi, kospi_mkt_inv, kodex200_inv, gobbus_inv, df_nasdaq_proxy):
-    """
-    [핵심 10대 요건으로 깔끔하게 재정비] 특정일(D0) 오후 3시 30분 기준 코스피 인버스(하락) 요건 판독
-    """
+    """특정일(D0) 오후 3시 30분 기준 코스피 인버스(하락) 10대 요건 판독"""
     df_k_until = df_kospi[df_kospi["Date"] <= d0_date]
     if len(df_k_until) < 20:
         return None
@@ -272,21 +262,17 @@ def evaluate_inverse_signals(d0_date, df_kospi, kospi_mkt_inv, kodex200_inv, gob
     h0 = float(cur["High"])
     fluc0 = float(cur["Fluc"])
 
-    # 1) 코스피 3연속 / 4연속 양봉(또는 상승 마감) 체크
     last3 = df_k_until.iloc[-3:]
     last4 = df_k_until.iloc[-4:]
     is_3bull = int(all((r["Close"] > r["Open"]) or (r["Fluc"] > 0) for _, r in last3.iterrows()))
     is_4bull = int(all((r["Close"] > r["Open"]) or (r["Fluc"] > 0) for _, r in last4.iterrows()))
 
-    # 2) 코스피 단기 이격 과열 (20일선 대비 이격도 102% 이상 또는 당일 +1.2% 이상 급등)
     ma20 = float(df_k_until["Close"].iloc[-20:].mean())
     disparity20 = (c0 / ma20 * 100) if ma20 > 0 else 100.0
     is_overheat = 1 if (disparity20 >= 102.0 or fluc0 >= 1.2) else 0
 
-    # 3) 장중 고점 저항 윗꼬리 발생 (고가 대비 종가가 -0.5% 이상 밀림)
     is_upper_wick = 1 if (h0 > 0 and ((h0 - c0) / h0 * 100) >= 0.5) else 0
 
-    # 4) 코스피 현물 수급 (코스피 전체 수급 우선, 누락 시 KODEX 200 수급으로 100% 보완)
     inst_k, for_k = kospi_mkt_inv.get(d0_date, (0.0, 0.0))
     if inst_k == 0.0 and for_k == 0.0:
         inst_k, for_k = kodex200_inv.get(d0_date, (0.0, 0.0))
@@ -295,11 +281,9 @@ def evaluate_inverse_signals(d0_date, df_kospi, kospi_mkt_inv, kodex200_inv, gob
     is_for_only_sell = 1 if (for_k < 0 and inst_k >= 0) else 0
     is_inst_only_sell = 1 if (inst_k < 0 and for_k >= 0) else 0
 
-    # 5) 선물/인버스 수급: KODEX 200선물인버스2X(252670)에서 외국인 순매수 (외인 선물 숏 포지션 대용)
     inst_gob, for_gob = gobbus_inv.get(d0_date, (0.0, 0.0))
     is_fut_short_bet = 1 if (for_gob > 0 or (for_gob + inst_gob) > 0) else 0
 
-    # 6) 오후 3시 30분 기준 미국 나스닥 흐름 (KODEX 미국나스닥100 15:30 종가 음봉 또는 하락)
     nas_sub = df_nasdaq_proxy[df_nasdaq_proxy["Date"] == d0_date] if not df_nasdaq_proxy.empty else pd.DataFrame()
     if not nas_sub.empty:
         nas_r = nas_sub.iloc[0]
@@ -309,7 +293,6 @@ def evaluate_inverse_signals(d0_date, df_kospi, kospi_mkt_inv, kodex200_inv, gob
         nas_fluc = 0.0
         nas_bear = 0
 
-    # 7) S급 인버스 복합 타점: [양매도 or 외인매도 or 선물숏매집] AND [3·4연속양봉 or 이격과열 or 오후나스닥약세 or 윗꼬리]
     supply_hit = (is_twin_sell == 1) or (is_for_only_sell == 1) or (is_fut_short_bet == 1)
     chart_hit = (is_3bull == 1) or (is_4bull == 1) or (is_overheat == 1) or (nas_bear == 1) or (is_upper_wick == 1)
     is_s_inverse = 1 if (supply_hit and chart_hit) else 0
@@ -359,31 +342,24 @@ def evaluate_inverse_signals(d0_date, df_kospi, kospi_mkt_inv, kodex200_inv, gob
         "Signals": inv_signals
     }
 
-
 def run_inverse_backtest_and_report():
-    """
-    [완벽 수정] 최근 1년(약 240거래일) 코스피 인버스 종가베팅 역추적 및 DB 영구 누적
-    - 구버전 오류 DB(표본 누락본) 자동 감지 후 전체 재구축(`Inv_Logic_V2` 마커 적용)
-    """
+    """최근 1년 코스피 인버스 종가베팅 역추적 및 DB 영구 누적"""
     print("Step 4: 코스피 지수 및 인버스/나스닥 프록시 최근 1년(260거래일) 데이터 수집 중...")
     df_kospi = get_naver_chart_df("KOSPI", count=260)
-    df_gobbus = get_naver_chart_df("252670", count=260)  # KODEX 200선물인버스2X (곱버스)
-    df_nasdaq = get_naver_chart_df("379810", count=260)  # KODEX 미국나스닥100 (15:30 미 선물 흐름 반영)
+    df_gobbus = get_naver_chart_df("252670", count=260)
+    df_nasdaq = get_naver_chart_df("379810", count=260)
 
     if df_kospi.empty or df_gobbus.empty:
         return []
 
-    # 1년치(약 250거래일) 수급을 빠짐없이 가져오기 위해 페이지 수 충분히 확보
     kospi_mkt_inv = get_kospi_market_investor(max_pages=28)
-    kodex200_inv = get_investor_data("069500", max_pages=15)  # 15페이지 * 20일 = 300거래일 전수 확보
-    gobbus_inv = get_investor_data("252670", max_pages=15)    # 15페이지 * 20일 = 300거래일 전수 확보
+    kodex200_inv = get_investor_data("069500", max_pages=15)
+    gobbus_inv = get_investor_data("252670", max_pages=15)
 
     if os.path.exists(INV_DB_FILE):
         try:
             inv_db = pd.read_csv(INV_DB_FILE, dtype={"Base_Date": str})
-            # [핵심] 수급 누락 버그가 있던 구버전 inverse_db.csv면 즉시 초기화 후 1년치 전체 재계산
             if "Inv_Logic_V2" not in inv_db.columns or "I10_S급인버스복합타점" not in inv_db.columns:
-                print("인버스 1년치 수급 전수 반영(Inv_Logic_V2)을 위해 인버스 DB를 새로 구축합니다...")
                 inv_db = pd.DataFrame()
                 existing_inv_dates = set()
             else:
@@ -426,9 +402,7 @@ def run_inverse_backtest_and_report():
         g_high_next = float(sub_g_next.iloc[0]["High"])
         gobbus_max_ret = round(((g_high_next - g_c0) / g_c0) * 100, 2) if g_c0 > 0 else 0.0
 
-        # 익일 오전 10시 전후 코스피 -0.5% 이상 하락 (곱버스 약 +1.0% 이상 수익)
         win_drop_05 = 1 if (kospi_max_drop <= -0.5 or gobbus_max_ret >= 1.0) else 0
-        # 익일 오전 10시 전후 코스피 -1.0% 이상 하락 (곱버스 약 +2.0% 이상 수익)
         win_drop_10 = 1 if (kospi_max_drop <= -1.0 or gobbus_max_ret >= 2.0) else 0
 
         row = {
@@ -476,13 +450,10 @@ def run_inverse_backtest_and_report():
         s_title = col.split("_", 1)[1]
         inv_stats.append((s_title, cnt, w05, w10, avg_drop, avg_gob))
 
-    # [핵심] 표본이 최소 8일 이상인 신뢰도 높은 조건만 우선하여 익일 -0.5% 하락 승률(w05) -> -1.0% 하락 승률(w10) 순으로 정렬
     valid_top5_pool = [x for x in inv_stats if x[1] >= 8]
     if len(valid_top5_pool) < 5:
         valid_top5_pool = inv_stats[:]
     valid_top5_pool.sort(key=lambda x: (x[2], x[3], x[5]), reverse=True)
-
-    # 전체 표는 순위대로 정렬
     inv_stats.sort(key=lambda x: (x[2], x[3], x[5]), reverse=True)
 
     latest_k_day = k_days[-1]
@@ -545,7 +516,6 @@ def run_inverse_backtest_and_report():
 
     return sec_lines
 
-
 def main():
     print("Step 1: 유니버스 및 전체 영업일 로드 중...")
     universe = get_major_universe()
@@ -561,8 +531,9 @@ def main():
         try:
             db_df = pd.read_csv(DB_FILE, dtype={"Ticker": str, "Base_Date": str})
             has_april = any(str(d).startswith("202604") for d in db_df["Base_Date"].dropna().unique())
-            if "Bet3_Win_3Pct" not in db_df.columns or "Logic_V2" not in db_df.columns or not has_april:
-                print("거래대금 상위 40위 선(先)필터링 기준 적용을 위해 전체 기간 통합 DB 역추적을 다시 시작합니다.")
+            # [핵심] 거래대금 상위 30위 선필터링(Logic_V3) 기준이 아니면 DB 초기화 후 30위 기준으로 깨끗하게 재구축
+            if "Bet3_Win_3Pct" not in db_df.columns or "Logic_V3" not in db_df.columns or not has_april:
+                print(f"거래대금 상위 {TOP_N_VOL}위 선(先)필터링(Logic_V3) 적용을 위해 전체 기간 통합 DB 역추적을 다시 시작합니다.")
                 db_df = pd.DataFrame()
                 existing_dates = set()
             else:
@@ -584,15 +555,13 @@ def main():
     possible_eval_days = [d for d in all_days[:-3] if d >= "20260401"]
     eval_days = [d for d in possible_eval_days if d not in existing_dates]
 
-    # [버그 완벽 수정] 1차(D0), 2차(D-1), 3차(D-2) 종가베팅 및 각 3일 연속 수급(D-3, D-4)이
-    # 절대로 누락되거나 흔들리지 않도록 최근 5거래일(all_days[-5:]) 전체를 항상 스캔 대상에 고정 포함합니다.
     day_0_latest = all_days[-1]
     day_m1_latest = all_days[-2]
     day_m2_latest = all_days[-3]
     d_m3_latest = all_days[-4]
     d_m4_latest = all_days[-5]
 
-    top40_by_day = {}
+    top30_by_day = {}
     top_vol_top10_by_day = {}
     tracked_tickers = set()
 
@@ -613,22 +582,23 @@ def main():
                 all_vol_pool.append((code, val * abs(fluc)))
 
         daily_stocks.sort(key=lambda x: x[1], reverse=True)
-        top40_vol_stocks = daily_stocks[:40]
+        # [핵심 수정] 거래대금 상위 40위 -> 30위(TOP_N_VOL)로 엄격 압축
+        top_vol_stocks = daily_stocks[:TOP_N_VOL]
 
-        selected_bullish_in_top40 = [
+        selected_bullish_in_top30 = [
             (vol_rank, code)
-            for vol_rank, (code, val, is_bull, fluc) in enumerate(top40_vol_stocks, 1)
+            for vol_rank, (code, val, is_bull, fluc) in enumerate(top_vol_stocks, 1)
             if is_bull and fluc >= 1.0
         ]
 
         all_vol_pool.sort(key=lambda x: x[1], reverse=True)
 
-        top40_by_day[d_str] = selected_bullish_in_top40
+        top30_by_day[d_str] = selected_bullish_in_top30
         top_vol_top10_by_day[d_str] = set([x[0] for x in all_vol_pool[:10]])
-        tracked_tickers.update([code for _, code in selected_bullish_in_top40])
+        tracked_tickers.update([code for _, code in selected_bullish_in_top30])
 
     pages_to_fetch = 8 if len(eval_days) > 10 else 3
-    print(f"Step 3: 대금 상위 40위 내 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
+    print(f"Step 3: 대금 상위 {TOP_N_VOL}위 내 양봉 주도주 {len(tracked_tickers)}개의 수급 데이터({pages_to_fetch}페이지) 수집 중...")
     inv_cache = {}
     for code in tracked_tickers:
         inv_cache[code] = get_investor_data(code, max_pages=pages_to_fetch)
@@ -650,7 +620,7 @@ def main():
             d_plus3 = all_days[idx + 3]
             pop_proxies = top_vol_top10_by_day.get(d0_date, set())
 
-            for vol_rank, code in top40_by_day.get(d0_date, []):
+            for vol_rank, code in top30_by_day.get(d0_date, []):
                 name = universe.get(code, code)
                 df_c = chart_cache[code]
                 df_until = df_c[df_c["Date"] <= d0_date]
@@ -706,7 +676,7 @@ def main():
                     "Bet2_Win_3Pct": bet2_win,
                     "Bet3_Max_Ret": bet3_ret,
                     "Bet3_Win_3Pct": bet3_win,
-                    "Logic_V2": 1,
+                    "Logic_V3": 1,
                 }
                 rec.update(sig_dict)
                 new_records.append(rec)
@@ -719,8 +689,12 @@ def main():
         print("DB에 데이터가 없습니다.")
         return
 
-    if "Regime" in db_df.columns:
-        db_df.drop(columns=["Regime"], inplace=True)
+    for drop_col in ["Regime", "Logic_V2"]:
+        if drop_col in db_df.columns:
+            db_df.drop(columns=[drop_col], inplace=True)
+
+    # 혹시라도 남아있는 30위 밖 데이터 필터링 보장
+    db_df = db_df[db_df["Rank"] <= TOP_N_VOL].copy()
 
     signal_cols = [c for c in db_df.columns if c.startswith("S") and "_" in c]
     db_df["Base_Date"] = db_df["Base_Date"].astype(str)
@@ -734,7 +708,7 @@ def main():
 
     db_df.sort_values(by=["Base_Date", "Rank"], ascending=[True, True], inplace=True)
     db_df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
-    print(f"영구 DB(총 {len(db_df)}건) 및 TOP 5 태깅 업데이트 완료!")
+    print(f"영구 DB(총 {len(db_df)}건, 대금 상위 {TOP_N_VOL}위 기준) 및 TOP 5 태깅 업데이트 완료!")
 
     total_cnt = len(db_df)
     unique_dates = sorted(db_df["Base_Date"].unique())
@@ -742,7 +716,7 @@ def main():
     min_dt = unique_dates[0]
     max_dt = unique_dates[-1]
 
-    top5_df = db_df[db_df["Is_Top5"] == 1]
+    top5_df = db_df[db_df["Is_Top5"] == 1].copy()
     top5_cnt = len(top5_df)
 
     def calc_metrics(sub):
@@ -760,15 +734,23 @@ def main():
     b1_w, b1_r, b2_w, b2_r, b3_w, b3_r = calc_metrics(db_df)
     t1_w, t1_r, t2_w, t2_r, t3_w, t3_r = calc_metrics(top5_df)
 
+    # 최근 3개월(최대 60거래일) 및 최근 1개월(최대 20거래일) 구간 정의
+    dates_3m = unique_dates[-60:]
+    dates_1m = unique_dates[-20:]
+    days_3m_cnt = len(dates_3m)
+    days_1m_cnt = len(dates_1m)
+    note_3m = f"최근 3개월({days_3m_cnt}거래일)" if total_days >= 60 else f"최근 3개월(누적 {days_3m_cnt}거래일)"
+    note_1m = f"최근 1개월({days_1m_cnt}거래일)"
+
     lines = [
         "# 🎯 트레이더 진 주도주 릴레이 종가베팅(1·2·3차) & 코스피 인버스 영구 누적 리포트",
         f"- **최종 업데이트:** {now.strftime('%Y-%m-%d %H:%M')} (KST)",
         f"- **누적 검증 기간:** `{min_dt}` ~ `{max_dt}` (총 **{total_days}거래일** / 전체 표본 **{total_cnt:,}개** / TOP 5 표본 **{top5_cnt:,}개**)",
-        f"- **선정 기준:** 당일 **거래대금 상위 40위 선(先)확정** 후 ➔ 그중 **+1% 이상 양봉 마감 종목**만 엄선 vs **깃허브 픽 TOP 5**\n",
-        "## 🏆 0-1. [전체 모수(대금 40위 내 양봉) vs 깃허브 추천 픽(TOP 5)] 실전 승률 비교",
+        f"- **선정 기준:** 당일 **거래대금 상위 {TOP_N_VOL}위 선(先)확정** 후 ➔ 그중 **+1% 이상 양봉 마감 종목**만 엄선 vs **깃허브 픽 TOP 5**\n",
+        f"## 🏆 0-1. [전체 모수(대금 {TOP_N_VOL}위 내 양봉) vs 깃허브 추천 픽(TOP 5)] 실전 승률 비교",
         "| 구분 | 1차 종베(D0➔D1) 승률 | 1차 평균최고 | **2차 종베(D1➔D2) 승률** | 2차 평균최고 | 3차 종베(D2➔D3) 승률 | 3차 평균최고 |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        f"| **대금 40위 내 양봉 주도주** | {b1_w}% | +{b1_r}% | **{b2_w}%** | +{b2_r}% | {b3_w}% | +{b3_r}% |",
+        f"| **대금 {TOP_N_VOL}위 내 양봉 주도주** | {b1_w}% | +{b1_r}% | **{b2_w}%** | +{b2_r}% | {b3_w}% | +{b3_r}% |",
         f"| ⭐ **깃허브 추천 TOP 5 (일 5개)** | **{t1_w}%** | **+{t1_r}%** | 🔥 **{t2_w}%** | **+{t2_r}%** | **{t3_w}%** | **+{t3_r}%** |\n",
         "## 📈 0-2. 최근 시황 흐름별(Rolling Window) 동적 승률 추이 (장세 자동 감지)",
         "| 조회 구간 (시황 온도계) | 거래일수 | 전체 1차 종베 | 전체 2차 종베 | ⭐ **TOP 5 1차 종베** | 🔥 **TOP 5 2차 종베** | ⭐ **TOP 5 3차 종베** |",
@@ -777,8 +759,8 @@ def main():
 
     windows = [
         ("🌐 **전체 누적 (All-Time)**", unique_dates),
-        ("📅 **최근 60거래일 (분기 추세)**", unique_dates[-60:]),
-        ("🗓️ **최근 20거래일 (한 달 시황)**", unique_dates[-20:]),
+        (f"📅 **{note_3m}**", dates_3m),
+        (f"🗓️ **{note_1m}**", dates_1m),
         ("⚡ **최근 5거래일 (이번 주 체감)**", unique_dates[-5:])
     ]
     for w_label, d_list in windows:
@@ -801,9 +783,102 @@ def main():
         tw1, _, tw2, _, tw3, _ = calc_metrics(sub_ym_t5)
         lines.append(f"| **{ym}** | {len(sub_ym)}건 / {len(sub_ym_t5)}건 | {aw1}% | {aw2}% | **{tw1}%** | **{tw2}%** | **{tw3}%** |")
 
+    # =========================================================================
+    # [신설 핵심 섹션] TOP 5 종목들의 12대 시그널 항목별 [누적 vs 최근 3개월 vs 최근 1개월] 승률 및 시황 분석
+    # =========================================================================
+    top5_3m = top5_df[top5_df["Base_Date"].isin(dates_3m)]
+    top5_1m = top5_df[top5_df["Base_Date"].isin(dates_1m)]
+
     lines.extend([
         "\n---",
-        "## 📊 1. 12대 개별 시그널 옵션별 [1차 vs 2차 vs 3차 종가베팅] 누적 승률 랭킹",
+        f"## 🔍 1-1. [깃허브 추천 TOP 5 전용] 12대 시그널 항목별 (전체 누적 vs {note_3m} vs {note_1m}) 승률 비교",
+        "| 순위 | TOP 5 내 시그널 항목 | 누적/3M/1M 표본 | **1차 종베 (누적 / 3개월 / 1개월)** | 🔥 **2차 종베 (누적 / 3개월 / 1개월)** | **1개월 트렌드(1차/2차)** |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: |"
+    ])
+
+    t5_sig_trends = []
+    for col in signal_cols:
+        s_name = col.split("_", 1)[1]
+        sub_all_s = top5_df[top5_df[col] == 1]
+        sub_3m_s = top5_3m[top5_3m[col] == 1]
+        sub_1m_s = top5_1m[top5_1m[col] == 1]
+
+        c_all, c_3m, c_1m = len(sub_all_s), len(sub_3m_s), len(sub_1m_s)
+        w1_all, _, w2_all, _, _, _ = calc_metrics(sub_all_s)
+        w1_3m, _, w2_3m, _, _, _ = calc_metrics(sub_3m_s)
+        w1_1m, _, w2_1m, _, _, _ = calc_metrics(sub_1m_s)
+
+        diff_w1 = round(w1_1m - w1_all, 1) if c_1m > 0 else 0.0
+        diff_w2 = round(w2_1m - w2_all, 1) if c_1m > 0 else 0.0
+
+        t5_sig_trends.append({
+            "name": s_name,
+            "c_all": c_all, "c_3m": c_3m, "c_1m": c_1m,
+            "w1_all": w1_all, "w1_3m": w1_3m, "w1_1m": w1_1m,
+            "w2_all": w2_all, "w2_3m": w2_3m, "w2_1m": w2_1m,
+            "diff_w1": diff_w1, "diff_w2": diff_w2,
+            "best_recent": max(w1_1m, w2_1m)
+        })
+
+    # 최근 1개월 2차 종베 승률 -> 최근 1개월 1차 종베 승률 -> 누적 2차 종베 승률 순으로 정렬
+    t5_sig_trends.sort(key=lambda x: (x["w2_1m"], x["w1_1m"], x["w2_all"]), reverse=True)
+
+    for idx, item in enumerate(t5_sig_trends, 1):
+        d1_str = f"{item['diff_w1']:+.1f}%p"
+        d2_str = f"{item['diff_w2']:+.1f}%p"
+        trend_badge = "🔥강세" if (item["diff_w1"] >= 3.0 or item["diff_w2"] >= 3.0) else ("❄️둔화" if (item["diff_w1"] <= -5.0 and item["diff_w2"] <= -5.0) else "➖유지")
+        lines.append(
+            f"| {idx}위 | **{item['name']}** | {item['c_all']}/{item['c_3m']}/{item['c_1m']}건 | "
+            f"{item['w1_all']}% / {item['w1_3m']}% / **{item['w1_1m']}%** | "
+            f"{item['w2_all']}% / {item['w2_3m']}% / **{item['w2_1m']}%** | "
+            f"{trend_badge} ({d1_str} / {d2_str}) |"
+        )
+
+    # 시황 흐름 자동 진단 로직
+    all_t5_w1, _, all_t5_w2, _, _, _ = calc_metrics(top5_df)
+    m3_t5_w1, _, m3_t5_w2, _, _, _ = calc_metrics(top5_3m)
+    m1_t5_w1, _, m1_t5_w2, _, _, _ = calc_metrics(top5_1m)
+
+    valid_1m_sigs = [x for x in t5_sig_trends if x["c_1m"] >= 3]
+    if not valid_1m_sigs:
+        valid_1m_sigs = t5_sig_trends[:]
+
+    hot_1st = sorted(valid_1m_sigs, key=lambda x: (x["w1_1m"], x["diff_w1"]), reverse=True)[:3]
+    hot_2nd = sorted(valid_1m_sigs, key=lambda x: (x["w2_1m"], x["diff_w2"]), reverse=True)[:3]
+    cool_sigs = sorted(valid_1m_sigs, key=lambda x: (x["diff_w1"] + x["diff_w2"]))[:2]
+
+    hot_1st_str = ", ".join([f"**{x['name']}**(1개월 {x['w1_1m']}%, 누적대비 {x['diff_w1']:+.1f}%p)" for x in hot_1st])
+    hot_2nd_str = ", ".join([f"**{x['name']}**(1개월 {x['w2_1m']}%, 누적대비 {x['diff_w2']:+.1f}%p)" for x in hot_2nd])
+    cool_str = ", ".join([f"**{x['name']}**(1차 {x['w1_1m']}% / 2차 {x['w2_1m']}%)" for x in cool_sigs])
+
+    if m1_t5_w2 > m1_t5_w1 + 3.0:
+        regime_msg = (
+            f"최근 1개월은 당일 바로 쏘는 1차 종베(**{m1_t5_w1}%**)보다 하루 쉬어간 뒤 재돌파하는 **2차 종베({m1_t5_w2}%)의 승률이 +{round(m1_t5_w2 - m1_t5_w1, 1)}%p 더 높은 '눌림목·N자형 순환매 장세'**입니다. "
+            f"당일 급등주 추격보다 D+1일 차 조정을 버틴 주도주 종가 공략이 훨씬 유리합니다."
+        )
+    elif m1_t5_w1 > m1_t5_w2 + 3.0:
+        regime_msg = (
+            f"최근 1개월은 **1차 종베 승률({m1_t5_w1}%)**이 2차 종베(**{m1_t5_w2}%**)를 앞서는 **'강한 당일 모멘텀·돌파 장세'**입니다. "
+            f"대금 상위 30위 내 수급이 집중된 당일 대장주를 지체 없이 1차 종가베팅으로 공략하는 것이 효과적입니다."
+        )
+    else:
+        regime_msg = (
+            f"최근 1개월은 **1차 종베({m1_t5_w1}%)**와 **2차 종베({m1_t5_w2}%)**가 균형을 이루는 **'주도주 연속성 장세'**입니다. "
+            f"아래 최근 1개월 강세 시그널을 보유한 TOP 5 종목 위주로 1·2차 릴레이 공략이 모두 유효합니다."
+        )
+
+    lines.extend([
+        "\n### 🧭 1-2. [시황 나침반] TOP 5 데이터로 본 요즘 시장 흐름 자동 판독 브리핑",
+        f"- **TOP 5 전체 승률 추이:** 전체 누적(1차 **{all_t5_w1}%** / 2차 **{all_t5_w2}%**) ➔ {note_3m}(1차 **{m3_t5_w1}%** / 2차 **{m3_t5_w2}%**) ➔ **{note_1m}(1차 {m1_t5_w1}% / 2차 {m1_t5_w2}%)**",
+        f"- **현재 장세 성격 진단:** {regime_msg}",
+        f"- 🔥 **최근 1개월 [1차 종베] 최고 승률 조건:** {hot_1st_str}",
+        f"- 🔥 **최근 1개월 [2차 종베] 최고 승률 조건:** {hot_2nd_str}",
+        f"- ⚠️ **최근 1개월 탄력이 둔화된 조건 (비중 축소 권장):** {cool_str}"
+    ])
+
+    lines.extend([
+        "\n---",
+        f"## 📊 1-3. [전체 모수(대금 {TOP_N_VOL}위 내 양봉)] 12대 시그널 옵션별 1·2·3차 누적 승률 랭킹",
         "| 순위 | D0 발생 옵션 (시그널) | 누적 표본 | **1차 종베 승률(D0➔D1)** | 1차 최고 | **2차 종베 승률(D1➔D2)** | 2차 최고 | **3차 종베 승률(D2➔D3)** | 3차 최고 |",
         "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     ])
@@ -839,17 +914,15 @@ def main():
         m3 = f"⭕ +{r['Bet3_Max_Ret']}%" if r["Bet3_Win_3Pct"] == 1 else f"❌ {r['Bet3_Max_Ret']}%"
         lines.append(f"| {r['Base_Date']} | **TOP {r['Pick_Rank']}** | **{r['Name']}** ({r['Ticker']}) | {r['Rank']}위 | {r['Sig_Count']}개 | {m1} | {m2} | {m3} |")
 
-    lines.append(f"\n---\n## 🚀 3. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 실전 TOP 5 추천 리스트\n")
+    lines.append(f"\n---\n## 🚀 3. 다음 거래일 오전(10시 전) +3% 매도 목표 — 금일({day_0_latest}) 실전 TOP 5 추천 리스트 (대금 {TOP_N_VOL}위 기준)\n")
 
     def build_candidate_table(target_d0, d_m1, d_m2):
         rows = []
-        # [버그 수정] 1차(당일)에만 실시간 인기검색어를 반영하지 않고, 일관된 거래대금+등락률 상위 TOP 10 기준을 사용하여
-        # 어제 뽑힌 1차 종베 TOP 5가 오늘 2차 종베, 내일 3차 종베로 넘어갈 때 종목이나 순위가 바뀌지 않도록 고정!
         pop_set = top_vol_top10_by_day.get(target_d0, set())
         if target_d0 == day_0_latest:
             pop_set = pop_set.union(popular_now)
 
-        for vol_rank, code in top40_by_day.get(target_d0, []):
+        for vol_rank, code in top30_by_day.get(target_d0, []):
             if code not in chart_cache:
                 continue
             c0, fluc0, _, sig_cnt, traits_str = evaluate_signals(code, target_d0, d_m1, d_m2, chart_cache, inv_cache, pop_set)
@@ -902,7 +975,7 @@ def main():
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print("미래 확장형 롤링 윈도우 & TOP 5 + 코스피 인버스 통합 리포트 생성이 완료되었습니다!")
+    print("미래 확장형 롤링 윈도우 & TOP 5(대금 30위 기준) + 코스피 인버스 통합 리포트 생성이 완료되었습니다!")
 
 if __name__ == "__main__":
     main()
